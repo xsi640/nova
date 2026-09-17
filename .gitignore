@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.native-cache/
+native/sqlite/
+target/
+src-tauri/target/
+*.log
+.DS_Store
+.idea/
+.vscode/

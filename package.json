@@ -1,0 +1,30 @@
+{
+  "name": "nova",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "tsc --noEmit && vite build",
+    "deps:native": "node scripts/prepare-native.mjs",
+    "preview": "vite preview",
+    "tauri": "node scripts/tauri.mjs",
+    "typecheck": "tsc --noEmit",
+    "check:rust": "node scripts/cargo.mjs check --manifest-path src-tauri/Cargo.toml",
+    "test:rust": "node scripts/cargo.mjs test --manifest-path src-tauri/Cargo.toml",
+    "check": "npm run typecheck && npm run test:rust"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.1.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.0"
+  }
+}
