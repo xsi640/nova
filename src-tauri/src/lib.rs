@@ -1,6 +1,10 @@
 mod commands;
 pub mod error;
+pub mod export;
 mod infrastructure;
+pub mod proactive;
+pub mod reminders;
+pub mod schedule_intent;
 
 use infrastructure::database::Database;
 use tauri::{Manager, WindowEvent};
@@ -8,6 +12,7 @@ use tauri::{Manager, WindowEvent};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir().map_err(|error| {
                 error::AppError::internal(format!(
@@ -49,6 +54,21 @@ pub fn run() {
             commands::get_api_profile_status,
             commands::save_api_profile,
             commands::test_api_profile,
+            commands::list_messages,
+            commands::send_message,
+            commands::retry_message,
+            commands::list_memories,
+            commands::update_memory,
+            commands::delete_memory,
+            commands::list_schedules,
+            commands::confirm_schedule,
+            commands::update_schedule,
+            commands::delete_schedule,
+            commands::get_schedule_candidate,
+            commands::export_local_data,
+            commands::show_notification,
+            commands::transcribe_audio,
+            commands::synthesize_speech,
             commands::set_window_mode,
         ])
         .run(tauri::generate_context!())

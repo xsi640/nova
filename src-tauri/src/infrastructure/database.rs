@@ -60,6 +60,33 @@ pub struct ChatMessage {
     pub status: String,
 }
 
+/// A durable user fact derived from one message in the local conversation timeline.
+///
+/// The source relation is intentionally mandatory: automatic memory extraction must
+/// always leave the user a way to inspect the message that produced a memory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRecord {
+    pub id: i64,
+    pub content: String,
+    pub source_message_id: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// An application-local calendar item. Datetimes are stored as ISO-8601 text so
+/// the command layer can preserve the user's timezone offset without conversion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleRecord {
+    pub id: i64,
+    pub title: String,
+    pub scheduled_at: String,
+    pub remind_at: String,
+    pub source_message_id: Option<i64>,
+    pub status: String,
+}
+
 pub struct Database {
     connection: Mutex<Connection>,
     path: PathBuf,
@@ -288,7 +315,9 @@ impl Database {
                 "SELECT id, role, content, created_at, status
                  FROM chat_messages ORDER BY id ASC",
             )
-            .map_err(|error| AppError::database(format!("failed to prepare chat query: {error}")))?;
+            .map_err(|error| {
+                AppError::database(format!("failed to prepare chat query: {error}"))
+            })?;
         let messages = statement
             .query_map([], |row| {
                 Ok(ChatMessage {
@@ -301,7 +330,9 @@ impl Database {
             })
             .map_err(|error| AppError::database(format!("failed to read chat messages: {error}")))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| AppError::database(format!("failed to decode chat messages: {error}")))?;
+            .map_err(|error| {
+                AppError::database(format!("failed to decode chat messages: {error}"))
+            })?;
         Ok(messages)
     }
 
@@ -367,11 +398,212 @@ impl Database {
         Ok(())
     }
 
+    pub fn list_memories(&self) -> Result<Vec<MemoryRecord>, AppError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, content, source_message_id, created_at, updated_at
+                 FROM memories ORDER BY updated_at DESC, id DESC",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to prepare memory query: {error}"))
+            })?;
+        statement
+            .query_map([], memory_from_row)
+            .map_err(|error| AppError::database(format!("failed to read memories: {error}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| AppError::database(format!("failed to decode memories: {error}")))
+    }
+
+    pub fn get_memory(&self, id: i64) -> Result<Option<MemoryRecord>, AppError> {
+        self.connection()?
+            .query_row(
+                "SELECT id, content, source_message_id, created_at, updated_at
+                 FROM memories WHERE id = ?1",
+                [id],
+                memory_from_row,
+            )
+            .optional()
+            .map_err(|error| AppError::database(format!("failed to read memory: {error}")))
+    }
+
+    pub fn insert_memory(
+        &self,
+        content: &str,
+        source_message_id: i64,
+    ) -> Result<MemoryRecord, AppError> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO memories (content, source_message_id) VALUES (?1, ?2)",
+                params![content, source_message_id],
+            )
+            .map_err(|error| AppError::database(format!("failed to save memory: {error}")))?;
+        get_memory_from_connection(&connection, connection.last_insert_rowid())?
+            .ok_or_else(|| AppError::database("saved memory could not be reloaded"))
+    }
+
+    /// Updates a memory's user-editable text and returns `None` when it no longer exists.
+    pub fn update_memory(&self, id: i64, content: &str) -> Result<Option<MemoryRecord>, AppError> {
+        let connection = self.connection()?;
+        let changed = connection
+            .execute(
+                "UPDATE memories SET content = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                params![content, id],
+            )
+            .map_err(|error| AppError::database(format!("failed to update memory: {error}")))?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        get_memory_from_connection(&connection, id)
+    }
+
+    /// Deletes a memory and reports whether an existing row was removed.
+    pub fn delete_memory(&self, id: i64) -> Result<bool, AppError> {
+        self.connection()?
+            .execute("DELETE FROM memories WHERE id = ?1", [id])
+            .map(|changed| changed != 0)
+            .map_err(|error| AppError::database(format!("failed to delete memory: {error}")))
+    }
+
+    pub fn list_schedules(&self) -> Result<Vec<ScheduleRecord>, AppError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT id, title, scheduled_at, remind_at, source_message_id, status
+                 FROM schedules ORDER BY scheduled_at ASC, id ASC",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to prepare schedule query: {error}"))
+            })?;
+        statement
+            .query_map([], schedule_from_row)
+            .map_err(|error| AppError::database(format!("failed to read schedules: {error}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| AppError::database(format!("failed to decode schedules: {error}")))
+    }
+
+    pub fn get_schedule(&self, id: i64) -> Result<Option<ScheduleRecord>, AppError> {
+        self.connection()?
+            .query_row(
+                "SELECT id, title, scheduled_at, remind_at, source_message_id, status
+                 FROM schedules WHERE id = ?1",
+                [id],
+                schedule_from_row,
+            )
+            .optional()
+            .map_err(|error| AppError::database(format!("failed to read schedule: {error}")))
+    }
+
+    /// Persists a schedule only after the conversation confirmation flow approves it.
+    pub fn insert_schedule(
+        &self,
+        title: &str,
+        scheduled_at: &str,
+        remind_at: &str,
+        source_message_id: Option<i64>,
+        status: &str,
+    ) -> Result<ScheduleRecord, AppError> {
+        let connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO schedules (title, scheduled_at, remind_at, source_message_id, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![title, scheduled_at, remind_at, source_message_id, status],
+            )
+            .map_err(|error| AppError::database(format!("failed to save schedule: {error}")))?;
+        get_schedule_from_connection(&connection, connection.last_insert_rowid())?
+            .ok_or_else(|| AppError::database("saved schedule could not be reloaded"))
+    }
+
+    /// Updates all mutable schedule fields and returns `None` when the schedule is absent.
+    pub fn update_schedule(
+        &self,
+        id: i64,
+        title: &str,
+        scheduled_at: &str,
+        remind_at: &str,
+        status: &str,
+    ) -> Result<Option<ScheduleRecord>, AppError> {
+        let connection = self.connection()?;
+        let changed = connection
+            .execute(
+                "UPDATE schedules
+                 SET title = ?1, scheduled_at = ?2, remind_at = ?3, status = ?4
+                 WHERE id = ?5",
+                params![title, scheduled_at, remind_at, status, id],
+            )
+            .map_err(|error| AppError::database(format!("failed to update schedule: {error}")))?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        get_schedule_from_connection(&connection, id)
+    }
+
+    /// Deletes an application-local schedule and reports whether it existed.
+    pub fn delete_schedule(&self, id: i64) -> Result<bool, AppError> {
+        self.connection()?
+            .execute("DELETE FROM schedules WHERE id = ?1", [id])
+            .map(|changed| changed != 0)
+            .map_err(|error| AppError::database(format!("failed to delete schedule: {error}")))
+    }
+
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, AppError> {
         self.connection
             .lock()
             .map_err(|_| AppError::database("database connection lock was poisoned"))
     }
+}
+
+fn memory_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRecord> {
+    Ok(MemoryRecord {
+        id: row.get(0)?,
+        content: row.get(1)?,
+        source_message_id: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+    })
+}
+
+fn get_memory_from_connection(
+    connection: &Connection,
+    id: i64,
+) -> Result<Option<MemoryRecord>, AppError> {
+    connection
+        .query_row(
+            "SELECT id, content, source_message_id, created_at, updated_at
+             FROM memories WHERE id = ?1",
+            [id],
+            memory_from_row,
+        )
+        .optional()
+        .map_err(|error| AppError::database(format!("failed to reload memory: {error}")))
+}
+
+fn schedule_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRecord> {
+    Ok(ScheduleRecord {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        scheduled_at: row.get(2)?,
+        remind_at: row.get(3)?,
+        source_message_id: row.get(4)?,
+        status: row.get(5)?,
+    })
+}
+
+fn get_schedule_from_connection(
+    connection: &Connection,
+    id: i64,
+) -> Result<Option<ScheduleRecord>, AppError> {
+    connection
+        .query_row(
+            "SELECT id, title, scheduled_at, remind_at, source_message_id, status
+             FROM schedules WHERE id = ?1",
+            [id],
+            schedule_from_row,
+        )
+        .optional()
+        .map_err(|error| AppError::database(format!("failed to reload schedule: {error}")))
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), AppError> {
@@ -494,6 +726,28 @@ fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             })?;
         transaction.commit().map_err(|error| {
             AppError::database(format!("failed to commit database migration 3: {error}"))
+        })?;
+    }
+
+    if current_version < 4 {
+        let transaction = connection.transaction().map_err(|error| {
+            AppError::database(format!("failed to start database migration 4: {error}"))
+        })?;
+        transaction
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_memories_source_message
+                    ON memories(source_message_id);
+                 CREATE INDEX IF NOT EXISTS idx_schedules_scheduled_at
+                    ON schedules(scheduled_at);
+                 CREATE INDEX IF NOT EXISTS idx_schedules_source_message
+                    ON schedules(source_message_id);
+                 INSERT INTO schema_migrations (version) VALUES (4);",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 4: {error}"))
+            })?;
+        transaction.commit().map_err(|error| {
+            AppError::database(format!("failed to commit database migration 4: {error}"))
         })?;
     }
 
@@ -637,5 +891,148 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].status, "sent");
         assert_eq!(messages[1].role, "assistant");
+    }
+
+    #[test]
+    fn manages_memories_with_a_traceable_source_message() {
+        let directory = tempdir().expect("temporary directory");
+        let database = Database::initialize(directory.path()).expect("database should initialize");
+        let source = database
+            .insert_chat_message("user", "我最近在准备项目方案", "sent")
+            .expect("save source message");
+
+        let memory = database
+            .insert_memory("最近正在准备项目方案", source.id)
+            .expect("save memory");
+        assert_eq!(memory.source_message_id, source.id);
+        assert_eq!(
+            database.get_memory(memory.id).expect("read memory"),
+            Some(memory.clone())
+        );
+
+        let updated = database
+            .update_memory(memory.id, "最近在准备项目方案评审")
+            .expect("update memory")
+            .expect("memory exists");
+        assert_eq!(updated.content, "最近在准备项目方案评审");
+        assert_eq!(updated.source_message_id, source.id);
+        assert_eq!(
+            database.list_memories().expect("list memories"),
+            vec![updated]
+        );
+
+        assert!(database.delete_memory(memory.id).expect("delete memory"));
+        assert!(
+            !database
+                .delete_memory(memory.id)
+                .expect("delete absent memory")
+        );
+        assert!(
+            database
+                .get_memory(memory.id)
+                .expect("read deleted memory")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn memory_source_foreign_key_prevents_orphaned_records() {
+        let directory = tempdir().expect("temporary directory");
+        let database = Database::initialize(directory.path()).expect("database should initialize");
+
+        let error = database
+            .insert_memory("没有来源的记忆", 42)
+            .expect_err("orphan memory should be rejected");
+        assert!(error.to_string().contains("failed to save memory"));
+    }
+
+    #[test]
+    fn manages_confirmed_schedules_in_chronological_order() {
+        let directory = tempdir().expect("temporary directory");
+        let database = Database::initialize(directory.path()).expect("database should initialize");
+        let source = database
+            .insert_chat_message("user", "明天九点半提醒我开评审会", "sent")
+            .expect("save source message");
+        let later = database
+            .insert_schedule(
+                "傍晚散步",
+                "2026-09-18T18:30:00+08:00",
+                "2026-09-18T18:20:00+08:00",
+                None,
+                "scheduled",
+            )
+            .expect("save later schedule");
+        let schedule = database
+            .insert_schedule(
+                "项目方案评审会",
+                "2026-09-18T09:30:00+08:00",
+                "2026-09-18T09:00:00+08:00",
+                Some(source.id),
+                "scheduled",
+            )
+            .expect("save confirmed schedule");
+
+        assert_eq!(
+            database
+                .list_schedules()
+                .expect("list schedules")
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            vec![schedule.id, later.id]
+        );
+
+        let updated = database
+            .update_schedule(
+                schedule.id,
+                "项目方案评审",
+                "2026-09-18T10:00:00+08:00",
+                "2026-09-18T09:30:00+08:00",
+                "scheduled",
+            )
+            .expect("update schedule")
+            .expect("schedule exists");
+        assert_eq!(updated.title, "项目方案评审");
+        assert_eq!(updated.source_message_id, Some(source.id));
+        assert!(database.delete_schedule(later.id).expect("delete schedule"));
+        assert!(
+            database
+                .get_schedule(later.id)
+                .expect("read deleted schedule")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deleting_a_source_message_detaches_but_keeps_its_schedule() {
+        let directory = tempdir().expect("temporary directory");
+        let database = Database::initialize(directory.path()).expect("database should initialize");
+        let source = database
+            .insert_chat_message("user", "周五给家人打电话", "sent")
+            .expect("save source message");
+        let schedule = database
+            .insert_schedule(
+                "给家人打电话",
+                "2026-09-20T18:30:00+08:00",
+                "2026-09-20T18:20:00+08:00",
+                Some(source.id),
+                "scheduled",
+            )
+            .expect("save schedule");
+
+        database
+            .connection()
+            .expect("connection")
+            .execute("DELETE FROM chat_messages WHERE id = ?1", [source.id])
+            .expect("delete source message");
+
+        assert_eq!(
+            database
+                .get_schedule(schedule.id)
+                .expect("read schedule")
+                .expect("schedule remains")
+                .source_message_id,
+            None
+        );
     }
 }

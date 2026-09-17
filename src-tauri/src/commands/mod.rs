@@ -1,16 +1,24 @@
 use std::time::{Duration, Instant};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use reqwest::{
+    StatusCode,
+    blocking::multipart::{Form, Part},
+};
 use serde::{Deserialize, Serialize};
-use tauri::{PhysicalPosition, PhysicalSize, State, WebviewWindow};
+use tauri::{AppHandle, PhysicalPosition, PhysicalSize, State, WebviewWindow};
+use tauri_plugin_notification::NotificationExt;
 
 use crate::{
     error::{AppError, CommandError},
     infrastructure::{
         credentials,
         database::{
-            ApiProfileRecord, AppSettings, ChatMessage, Database, PersonaProfile, WindowState,
+            ApiProfileRecord, AppSettings, ChatMessage, Database, MemoryRecord, PersonaProfile,
+            ScheduleRecord, WindowState,
         },
     },
+    schedule_intent::{LocalDate, parse_schedule_intent},
 };
 
 #[derive(Debug, Serialize)]
@@ -185,12 +193,13 @@ pub async fn test_api_profile(
         .get_api_profile(capability.as_str())?
         .ok_or_else(|| AppError::Configuration("请先保存 API 配置".to_owned()))?;
     let api_key = credentials::get_secret(&profile.secret_ref)?;
-    let models_url = format!("{}/models", profile.base_url.trim_end_matches('/'));
+    let endpoint = format!("{}{}", profile.base_url.trim_end_matches('/'), profile.path);
 
-    let result =
-        tauri::async_runtime::spawn_blocking(move || test_connection(&models_url, &api_key))
-            .await
-            .map_err(|error| AppError::internal(format!("连接测试任务失败：{error}")))??;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        test_capability_connection(&endpoint, &api_key)
+    })
+    .await
+    .map_err(|error| AppError::internal(format!("连接测试任务失败：{error}")))??;
     database.mark_api_profile_tested(capability.as_str())?;
     Ok(result)
 }
@@ -221,24 +230,25 @@ fn validate_base_url(value: String) -> Result<String, CommandError> {
     Ok(value)
 }
 
-fn test_connection(url: &str, api_key: &str) -> Result<ApiTestResult, CommandError> {
-    let client_builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(15));
-    #[cfg(test)]
-    let client_builder = client_builder.no_proxy();
-    let client = client_builder
-        .build()
-        .map_err(|error| AppError::internal(format!("无法创建网络客户端：{error}")))?;
+/// Test the configured capability endpoint without invoking a model or uploading user audio.
+///
+/// OpenAI-compatible providers commonly answer `OPTIONS` with either a successful CORS
+/// response or `405 Method Not Allowed`. Both prove that the configured endpoint is reachable;
+/// an authorization response is still surfaced as an invalid key. This deliberately avoids a
+/// billable transcription or speech-generation request during settings validation.
+fn test_capability_connection(url: &str, api_key: &str) -> Result<ApiTestResult, CommandError> {
+    let client = http_client(Duration::from_secs(15))?;
     let started = Instant::now();
     let response = client
-        .get(url)
+        .request(reqwest::Method::OPTIONS, url)
         .bearer_auth(api_key)
         .send()
         .map_err(|error| AppError::Network(format!("连接 API 失败：{error}")))?;
     let status = response.status();
-    if status.as_u16() == 401 || status.as_u16() == 403 {
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         return Err(AppError::Authorization("API Key 无效或没有访问权限".to_owned()).into());
     }
-    if !status.is_success() {
+    if !status.is_success() && status != StatusCode::METHOD_NOT_ALLOWED {
         return Err(AppError::Service(format!("API 返回状态码 {}", status.as_u16())).into());
     }
     Ok(ApiTestResult {
@@ -287,6 +297,159 @@ pub fn list_messages(database: State<'_, Database>) -> Result<Vec<ChatMessage>, 
 }
 
 #[tauri::command]
+pub fn list_memories(database: State<'_, Database>) -> Result<Vec<MemoryRecord>, CommandError> {
+    Ok(database.list_memories()?)
+}
+
+#[tauri::command]
+pub fn update_memory(
+    database: State<'_, Database>,
+    id: i64,
+    content: String,
+) -> Result<MemoryRecord, CommandError> {
+    let content = required_text("记忆内容", content, 600)?;
+    database
+        .update_memory(id, &content)?
+        .ok_or_else(|| AppError::Configuration("找不到要修改的记忆".to_owned()).into())
+}
+
+#[tauri::command]
+pub fn delete_memory(database: State<'_, Database>, id: i64) -> Result<bool, CommandError> {
+    Ok(database.delete_memory(id)?)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleInput {
+    title: String,
+    scheduled_at: String,
+    remind_at: String,
+    source_message_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleUpdateInput {
+    id: i64,
+    title: String,
+    scheduled_at: String,
+    remind_at: String,
+    status: String,
+}
+
+#[tauri::command]
+pub fn list_schedules(database: State<'_, Database>) -> Result<Vec<ScheduleRecord>, CommandError> {
+    Ok(database.list_schedules()?)
+}
+
+/// Persists a schedule only after the user has explicitly confirmed the details in the UI.
+#[tauri::command]
+pub fn confirm_schedule(
+    database: State<'_, Database>,
+    input: ScheduleInput,
+) -> Result<ScheduleRecord, CommandError> {
+    let (title, scheduled_at, remind_at) =
+        validate_schedule_fields(input.title, input.scheduled_at, input.remind_at)?;
+    Ok(database.insert_schedule(
+        &title,
+        &scheduled_at,
+        &remind_at,
+        input.source_message_id,
+        "scheduled",
+    )?)
+}
+
+#[tauri::command]
+pub fn update_schedule(
+    database: State<'_, Database>,
+    input: ScheduleUpdateInput,
+) -> Result<ScheduleRecord, CommandError> {
+    let (title, scheduled_at, remind_at) =
+        validate_schedule_fields(input.title, input.scheduled_at, input.remind_at)?;
+    if !matches!(
+        input.status.as_str(),
+        "scheduled" | "completed" | "cancelled"
+    ) {
+        return Err(AppError::Configuration("日程状态无效".to_owned()).into());
+    }
+    database
+        .update_schedule(input.id, &title, &scheduled_at, &remind_at, &input.status)?
+        .ok_or_else(|| AppError::Configuration("找不到要修改的日程".to_owned()).into())
+}
+
+#[tauri::command]
+pub fn delete_schedule(database: State<'_, Database>, id: i64) -> Result<bool, CommandError> {
+    Ok(database.delete_schedule(id)?)
+}
+
+/// Returns the privacy-preserving JSON export for the UI to save to a user-selected file.
+/// The export module uses an explicit allow-list and never reads credentials or API settings.
+#[tauri::command]
+pub fn export_local_data(database: State<'_, Database>) -> Result<String, CommandError> {
+    crate::export::local_data_export_json(&database).map_err(Into::into)
+}
+
+/// Hands a user-visible notification to the operating system. Callers supply only already
+/// rendered text; no API credentials, message history, or input activity leave the app.
+#[tauri::command]
+pub fn show_notification(app: AppHandle, title: String, body: String) -> Result<(), CommandError> {
+    let title = required_text("通知标题", title, 120)?;
+    let body = required_text("通知内容", body, 500)?;
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|error| AppError::PlatformPermission(format!("无法显示系统通知：{error}")))?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleCandidateInput {
+    content: String,
+    source_message_id: i64,
+    year: i32,
+    month: u8,
+    day: u8,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleCandidate {
+    title: String,
+    scheduled_at: String,
+    remind_at: String,
+    source_message_id: i64,
+}
+
+/// Parses only unambiguous, explicitly requested local schedules. It returns a candidate; the
+/// UI must call `confirm_schedule` only after the user accepts the confirmation card.
+#[tauri::command]
+pub fn get_schedule_candidate(
+    database: State<'_, Database>,
+    input: ScheduleCandidateInput,
+) -> Result<Option<ScheduleCandidate>, CommandError> {
+    let source = database
+        .get_chat_message(input.source_message_id)?
+        .filter(|message| message.role == "user" && message.status == "sent")
+        .ok_or_else(|| AppError::Configuration("找不到对应的已发送用户消息".to_owned()))?;
+    if source.content != input.content {
+        return Err(AppError::Configuration("日程候选的消息内容不匹配".to_owned()).into());
+    }
+    let today = LocalDate::new(input.year, input.month, input.day)
+        .ok_or_else(|| AppError::Configuration("本地日期无效".to_owned()))?;
+    Ok(
+        parse_schedule_intent(&source.content, today).map(|intent| ScheduleCandidate {
+            title: intent.title,
+            scheduled_at: intent.scheduled_at,
+            remind_at: intent.remind_at,
+            source_message_id: input.source_message_id,
+        }),
+    )
+}
+
+#[tauri::command]
 pub async fn send_message(
     database: State<'_, Database>,
     content: String,
@@ -308,7 +471,14 @@ pub async fn retry_message(
         return Err(AppError::Configuration("这条消息当前不能重试".to_owned()).into());
     }
     database.update_chat_message_status(message.id, "pending")?;
-    complete_chat(&database, ChatMessage { status: "pending".to_owned(), ..message }).await
+    complete_chat(
+        &database,
+        ChatMessage {
+            status: "pending".to_owned(),
+            ..message
+        },
+    )
+    .await
 }
 
 async fn complete_chat(
@@ -370,6 +540,7 @@ async fn complete_chat(
             ..user_message.clone()
         };
         let assistant_message = database.insert_chat_message("assistant", &reply, "sent")?;
+        persist_memory_candidate(database, &user_message);
         Ok(ChatExchange {
             user_message,
             assistant_message,
@@ -381,6 +552,50 @@ async fn complete_chat(
         database.update_chat_message_status(user_message.id, "failed")?;
     }
     result
+}
+
+/// Save only explicit, durable facts. This conservative local extraction is deliberately
+/// best-effort: it never delays or invalidates an otherwise successful conversation, and users
+/// can edit or delete every resulting record from the memory page.
+fn persist_memory_candidate(database: &Database, source: &ChatMessage) {
+    let Some(content) = extract_memory_candidate(&source.content) else {
+        return;
+    };
+    let duplicate = database
+        .list_memories()
+        .map(|memories| memories.iter().any(|memory| memory.content == content))
+        .unwrap_or(true);
+    if !duplicate {
+        let _ = database.insert_memory(&content, source.id);
+    }
+}
+
+fn extract_memory_candidate(message: &str) -> Option<String> {
+    let sentence = message
+        .trim()
+        .split(['。', '！', '？', '\n'])
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '，' | ',' | '。')
+        })
+        .trim();
+    let explicit = sentence
+        .strip_prefix("记住")
+        .map(str::trim)
+        .map(|value| {
+            value.trim_start_matches(|character: char| matches!(character, '：' | ':' | '，' | ','))
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or(sentence);
+    let is_durable = sentence.starts_with("记住")
+        || explicit.starts_with("我喜欢")
+        || explicit.starts_with("我不喜欢")
+        || explicit.starts_with("我叫")
+        || explicit.starts_with("我住在")
+        || explicit.starts_with("我的生日");
+    let length = explicit.chars().count();
+    (is_durable && (2..=240).contains(&length)).then(|| explicit.to_owned())
 }
 
 fn request_chat_completion(
@@ -422,6 +637,214 @@ fn http_client(timeout: Duration) -> Result<reqwest::blocking::Client, CommandEr
     client_builder
         .build()
         .map_err(|error| AppError::internal(format!("无法创建网络客户端：{error}")).into())
+}
+
+const MAX_AUDIO_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+const MAX_SYNTHESIZED_AUDIO_BYTES: usize = 25 * 1024 * 1024;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptionResult {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TranscriptionResponse {
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SpeechSynthesisRequest {
+    model: String,
+    input: String,
+    voice: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechSynthesisResult {
+    /// Base64 keeps the binary payload inside Tauri's typed command boundary. It is intended for
+    /// an in-memory browser `Audio` object and is never persisted to the chat database.
+    audio_base64: String,
+    content_type: String,
+}
+
+#[tauri::command]
+pub async fn transcribe_audio(
+    database: State<'_, Database>,
+    audio: Vec<u8>,
+    file_name: Option<String>,
+    mime_type: Option<String>,
+) -> Result<TranscriptionResult, CommandError> {
+    if audio.is_empty() {
+        return Err(AppError::Audio("没有可供识别的录音".to_owned()).into());
+    }
+    if audio.len() > MAX_AUDIO_UPLOAD_BYTES {
+        return Err(AppError::Audio("录音文件不能超过 25 MB".to_owned()).into());
+    }
+
+    let profile = enabled_audio_profile(&database, "transcription", "语音识别")?;
+    let api_key = credentials::get_secret(&profile.secret_ref)?;
+    let endpoint = format!("{}{}", profile.base_url.trim_end_matches('/'), profile.path);
+    let file_name = validate_audio_file_name(file_name)?;
+    let mime_type = validate_audio_mime_type(mime_type)?;
+    let model = profile.model;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        request_transcription(&endpoint, &api_key, &model, audio, &file_name, &mime_type)
+    })
+    .await
+    .map_err(|error| AppError::internal(format!("语音识别任务失败：{error}")))??;
+    Ok(TranscriptionResult { text: result })
+}
+
+#[tauri::command]
+pub async fn synthesize_speech(
+    database: State<'_, Database>,
+    text: String,
+    voice: Option<String>,
+) -> Result<SpeechSynthesisResult, CommandError> {
+    let input = required_text("要朗读的文本", text, 8_000)?;
+    let voice = required_text("音色", voice.unwrap_or_else(|| "alloy".to_owned()), 64)?;
+    let profile = enabled_audio_profile(&database, "speech", "语音合成")?;
+    let api_key = credentials::get_secret(&profile.secret_ref)?;
+    let endpoint = format!("{}{}", profile.base_url.trim_end_matches('/'), profile.path);
+    let request = SpeechSynthesisRequest {
+        model: profile.model,
+        input,
+        voice,
+    };
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        request_speech_synthesis(&endpoint, &api_key, &request)
+    })
+    .await
+    .map_err(|error| AppError::internal(format!("语音合成任务失败：{error}")))??;
+    Ok(result)
+}
+
+fn enabled_audio_profile(
+    database: &Database,
+    capability: &str,
+    label: &str,
+) -> Result<ApiProfileRecord, CommandError> {
+    database
+        .get_api_profile(capability)?
+        .filter(|profile| profile.enabled)
+        .ok_or_else(|| AppError::Configuration(format!("请先配置并启用{label} API")).into())
+}
+
+fn validate_audio_file_name(file_name: Option<String>) -> Result<String, CommandError> {
+    let file_name = file_name
+        .unwrap_or_else(|| "recording.webm".to_owned())
+        .trim()
+        .to_owned();
+    if file_name.is_empty()
+        || file_name.chars().count() > 120
+        || file_name.contains(['/', '\\', '\0'])
+    {
+        return Err(AppError::Audio("录音文件名无效".to_owned()).into());
+    }
+    Ok(file_name)
+}
+
+fn validate_audio_mime_type(mime_type: Option<String>) -> Result<String, CommandError> {
+    let mime_type = mime_type
+        .unwrap_or_else(|| "audio/webm".to_owned())
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(
+        mime_type.as_str(),
+        "audio/webm"
+            | "audio/wav"
+            | "audio/x-wav"
+            | "audio/mpeg"
+            | "audio/mp4"
+            | "audio/ogg"
+            | "audio/flac"
+            | "audio/x-m4a"
+    ) {
+        return Err(AppError::Audio("不支持该录音格式".to_owned()).into());
+    }
+    Ok(mime_type)
+}
+
+fn request_transcription(
+    url: &str,
+    api_key: &str,
+    model: &str,
+    audio: Vec<u8>,
+    file_name: &str,
+    mime_type: &str,
+) -> Result<String, CommandError> {
+    let file = Part::bytes(audio)
+        .file_name(file_name.to_owned())
+        .mime_str(mime_type)
+        .map_err(|error| AppError::Audio(format!("无法处理录音格式：{error}")))?;
+    let form = Form::new()
+        .text("model", model.to_owned())
+        .part("file", file);
+    let response = http_client(Duration::from_secs(90))?
+        .post(url)
+        .bearer_auth(api_key)
+        .multipart(form)
+        .send()
+        .map_err(|error| AppError::Network(format!("发送录音失败：{error}")))?;
+    validate_audio_api_response(response.status(), "语音识别")?;
+    let response = response
+        .json::<TranscriptionResponse>()
+        .map_err(|error| AppError::Service(format!("无法解析语音识别 API 响应：{error}")))?;
+    required_text("识别结果", response.text, 8_000)
+}
+
+fn request_speech_synthesis(
+    url: &str,
+    api_key: &str,
+    request: &SpeechSynthesisRequest,
+) -> Result<SpeechSynthesisResult, CommandError> {
+    let response = http_client(Duration::from_secs(90))?
+        .post(url)
+        .bearer_auth(api_key)
+        .json(request)
+        .send()
+        .map_err(|error| AppError::Network(format!("请求语音合成失败：{error}")))?;
+    validate_audio_api_response(response.status(), "语音合成")?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("audio/mpeg")
+        .split(';')
+        .next()
+        .unwrap_or("audio/mpeg")
+        .trim()
+        .to_ascii_lowercase();
+    if !content_type.starts_with("audio/") && content_type != "application/octet-stream" {
+        return Err(AppError::Audio("语音合成 API 没有返回音频数据".to_owned()).into());
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|error| AppError::Network(format!("读取合成音频失败：{error}")))?;
+    if bytes.is_empty() {
+        return Err(AppError::Audio("语音合成 API 返回了空音频".to_owned()).into());
+    }
+    if bytes.len() > MAX_SYNTHESIZED_AUDIO_BYTES {
+        return Err(AppError::Audio("合成音频超过 25 MB，无法播放".to_owned()).into());
+    }
+    Ok(SpeechSynthesisResult {
+        audio_base64: BASE64.encode(bytes),
+        content_type,
+    })
+}
+
+fn validate_audio_api_response(status: StatusCode, capability: &str) -> Result<(), CommandError> {
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+        return Err(AppError::Authorization("API Key 无效或没有访问权限".to_owned()).into());
+    }
+    if !status.is_success() {
+        return Err(
+            AppError::Service(format!("{capability} API 返回状态码 {}", status.as_u16())).into(),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -477,6 +900,50 @@ pub fn restore_window_state(window: &WebviewWindow, state: &WindowState) -> Resu
             })?;
     }
     Ok(())
+}
+
+fn validate_schedule_fields(
+    title: String,
+    scheduled_at: String,
+    remind_at: String,
+) -> Result<(String, String, String), CommandError> {
+    let title = required_text("日程标题", title, 160)?;
+    let scheduled_at = validate_local_datetime("日程时间", scheduled_at)?;
+    let remind_at = validate_local_datetime("提醒时间", remind_at)?;
+    if remind_at > scheduled_at {
+        return Err(AppError::Configuration("提醒时间不能晚于日程时间".to_owned()).into());
+    }
+    Ok((title, scheduled_at, remind_at))
+}
+
+/// The UI sends the value from a native `datetime-local` control. Keep it as local wall-clock
+/// time: application schedules deliberately do not read or modify the system calendar.
+fn validate_local_datetime(label: &str, value: String) -> Result<String, CommandError> {
+    let value = value.trim().to_owned();
+    let valid = value.len() == 16
+        && value.as_bytes().get(4) == Some(&b'-')
+        && value.as_bytes().get(7) == Some(&b'-')
+        && value.as_bytes().get(10) == Some(&b'T')
+        && value.as_bytes().get(13) == Some(&b':')
+        && value.bytes().enumerate().all(|(index, character)| {
+            matches!(index, 4 | 7 | 10 | 13) || character.is_ascii_digit()
+        });
+    if !valid {
+        return Err(AppError::Configuration(format!("{label}格式应为 YYYY-MM-DDTHH:MM")).into());
+    }
+    let parse = |range: std::ops::Range<usize>| value[range].parse::<u8>();
+    let month = parse(5..7).ok();
+    let day = parse(8..10).ok();
+    let hour = parse(11..13).ok();
+    let minute = parse(14..16).ok();
+    if !matches!(month, Some(1..=12))
+        || !matches!(day, Some(1..=31))
+        || !matches!(hour, Some(0..=23))
+        || !matches!(minute, Some(0..=59))
+    {
+        return Err(AppError::Configuration(format!("{label}不是有效时间")).into());
+    }
+    Ok(value)
 }
 
 fn required_text(label: &str, value: String, max_chars: usize) -> Result<String, CommandError> {
@@ -539,6 +1006,33 @@ mod tests {
         (format!("http://{address}/models"), handle)
     }
 
+    fn mock_audio_api(
+        status: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock audio API");
+        let address = listener.local_addr().expect("mock audio API address");
+        let status = status.to_owned();
+        let content_type = content_type.to_owned();
+        let body = body.to_vec();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 4096];
+            let length = stream.read(&mut request).expect("read request");
+            let request = String::from_utf8_lossy(&request[..length]).to_ascii_lowercase();
+            assert!(request.contains("authorization: bearer test-secret"));
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write response headers");
+            stream.write_all(&body).expect("write response body");
+        });
+        (format!("http://{address}/audio"), handle)
+    }
+
     #[test]
     fn bootstrap_response_serializes_camel_case_fields() {
         let response = BootstrapResponse {
@@ -579,7 +1073,8 @@ mod tests {
     #[test]
     fn tests_an_openai_compatible_connection_without_exposing_the_secret() {
         let (url, server) = mock_api("200 OK");
-        let result = super::test_connection(&url, "test-secret").expect("connection succeeds");
+        let result =
+            super::test_capability_connection(&url, "test-secret").expect("connection succeeds");
         server.join().expect("mock API exits");
         assert!(result.success);
     }
@@ -587,9 +1082,101 @@ mod tests {
     #[test]
     fn maps_unauthorized_api_responses() {
         let (url, server) = mock_api("401 Unauthorized");
-        let error = super::test_connection(&url, "test-secret").expect_err("connection fails");
+        let error =
+            super::test_capability_connection(&url, "test-secret").expect_err("connection fails");
         server.join().expect("mock API exits");
         assert!(matches!(error.category, ErrorCategory::Authorization));
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn capability_connection_accepts_a_non_billable_method_not_allowed_response() {
+        let (url, server) = mock_api("405 Method Not Allowed");
+        let result = super::test_capability_connection(&url, "test-secret")
+            .expect("endpoint reachability succeeds");
+        server.join().expect("mock API exits");
+        assert!(result.success);
+    }
+
+    #[test]
+    fn transcription_uploads_audio_and_returns_trimmed_text() {
+        let (url, server) = mock_audio_api(
+            "200 OK",
+            "application/json",
+            r#"{"text":"  你好呀  "}"#.as_bytes(),
+        );
+        let text = super::request_transcription(
+            &url,
+            "test-secret",
+            "transcription-model",
+            vec![1, 2, 3],
+            "recording.webm",
+            "audio/webm",
+        )
+        .expect("transcription succeeds");
+        server.join().expect("mock API exits");
+        assert_eq!(text, "你好呀");
+    }
+
+    #[test]
+    fn speech_synthesis_returns_base64_audio_with_a_safe_content_type() {
+        let (url, server) = mock_audio_api("200 OK", "audio/mpeg; charset=binary", &[1, 2, 3]);
+        let result = super::request_speech_synthesis(
+            &url,
+            "test-secret",
+            &super::SpeechSynthesisRequest {
+                model: "speech-model".to_owned(),
+                input: "你好".to_owned(),
+                voice: "alloy".to_owned(),
+            },
+        )
+        .expect("speech synthesis succeeds");
+        server.join().expect("mock API exits");
+        assert_eq!(result.content_type, "audio/mpeg");
+        assert_eq!(result.audio_base64, "AQID");
+    }
+
+    #[test]
+    fn rejects_unsafe_audio_metadata_before_uploading_it() {
+        assert!(super::validate_audio_file_name(Some("../recording.webm".to_owned())).is_err());
+        assert!(super::validate_audio_mime_type(Some("text/html".to_owned())).is_err());
+        assert_eq!(
+            super::validate_audio_mime_type(None).expect("default MIME type"),
+            "audio/webm"
+        );
+    }
+
+    #[test]
+    fn validates_schedule_time_fields_and_reminder_order() {
+        assert!(
+            super::validate_schedule_fields(
+                "项目评审".to_owned(),
+                "2026-09-18T10:00".to_owned(),
+                "2026-09-18T09:30".to_owned(),
+            )
+            .is_ok()
+        );
+        assert!(
+            super::validate_schedule_fields(
+                "项目评审".to_owned(),
+                "2026-09-18T10:00".to_owned(),
+                "2026-09-18T10:01".to_owned(),
+            )
+            .is_err()
+        );
+        assert!(super::validate_local_datetime("日程时间", "2026-19-18T10:00".to_owned()).is_err());
+    }
+
+    #[test]
+    fn extracts_only_explicit_durable_memory_candidates() {
+        assert_eq!(
+            super::extract_memory_candidate("记住：我喜欢周末去爬山。之后再聊"),
+            Some("我喜欢周末去爬山".to_owned())
+        );
+        assert_eq!(
+            super::extract_memory_candidate("我叫小苏，今天有点累"),
+            Some("我叫小苏，今天有点累".to_owned())
+        );
+        assert_eq!(super::extract_memory_candidate("今天下雨了"), None);
     }
 }

@@ -110,28 +110,90 @@ nav { display: grid; gap: 7px; }
 .status--ready { color: #66806f; }
 .status--ready .status__dot { background: #6b9879; box-shadow: 0 0 0 4px rgba(107, 152, 121, 0.12); }
 
-.conversation { width: min(760px, calc(100% - 64px)); margin: 0 auto; padding: 26px 0 42px; }
+.conversation { width: min(760px, calc(100% - 64px)); margin: 0 auto; padding: 26px 0 42px; overflow-y: auto; }
 .day-divider { display: flex; align-items: center; gap: 14px; margin-bottom: 30px; color: #ad9ea0; font-size: 10px; }
 .day-divider::before, .day-divider::after { content: ""; flex: 1; height: 1px; background: rgba(91, 66, 70, 0.08); }
-.message { display: flex; gap: 13px; align-items: flex-start; }
+.conversation__loading { margin: 0; color: var(--muted); font-size: 12px; text-align: center; }
+.message { display: flex; gap: 13px; align-items: flex-start; margin-top: 18px; }
 .avatar { width: 34px; height: 34px; border-radius: 12px; font-family: Georgia, serif; }
 .message__name { margin: 1px 0 7px; color: #8e7478; font-size: 11px; }
+.message__content { min-width: 0; }
 .bubble { max-width: 520px; padding: 15px 18px; border: 1px solid rgba(129, 83, 89, 0.08); border-radius: 4px 16px 16px; background: var(--surface); box-shadow: 0 8px 28px rgba(77, 47, 51, 0.06); }
 .bubble p { margin: 0; line-height: 1.75; font-size: 14px; }
+.message--user { justify-content: flex-end; }
+.message--user .bubble { border: 0; border-radius: 16px 4px 16px 16px; background: var(--accent); color: white; box-shadow: 0 8px 24px color-mix(in srgb, var(--accent) 18%, transparent); }
+.message__state { display: flex; align-items: center; gap: 8px; margin-top: 7px; color: var(--muted); font-size: 10px; }
+.message--user .message__state { justify-content: flex-end; }
+.message__state--failed { color: #b75b5b; }
+.message__recovery { display: inline-flex; gap: 7px; }
+.message__recovery button { padding: 0; border: 0; border-bottom: 1px solid currentColor; background: transparent; color: inherit; cursor: pointer; font-size: inherit; }
+.message__recovery button:disabled { cursor: default; opacity: 0.55; }
 
 .composer { position: relative; display: grid; grid-template-columns: auto 1fr auto; gap: 10px; width: min(800px, calc(100% - 64px)); margin: 0 auto 28px; padding: 10px; border: 1px solid rgba(93, 64, 68, 0.12); border-radius: 17px; background: var(--surface); box-shadow: 0 18px 50px rgba(74, 47, 51, 0.1); }
-.composer textarea { resize: none; align-self: center; border: 0; outline: 0; background: transparent; color: #403538; }
+.composer textarea { resize: none; align-self: center; border: 0; outline: 0; background: transparent; color: var(--text); }
 .composer textarea::placeholder { color: #b0a3a4; }
 .voice-button, .send-button { border: 0; border-radius: 11px; }
 .voice-button { width: 38px; height: 38px; background: #f0e8e5; color: #9d6a70; }
+.voice-button { cursor: pointer; transition: 160ms ease; }
+.voice-button--recording { background: #b75b5b; color: white; box-shadow: 0 0 0 5px rgba(183, 91, 91, 0.15); animation: recording-pulse 1.15s ease-in-out infinite; }
 .send-button { padding: 0 19px; background: var(--accent); color: white; cursor: pointer; }
 .voice-button:disabled, .send-button:disabled { opacity: 0.55; }
 .composer__hint { position: absolute; right: 5px; bottom: -23px; margin: 0; color: #aa9d9f; font-size: 9px; }
+.composer__hint--error { color: #b75b5b; }
+.transcript-confirmation { display: grid; grid-template-columns: minmax(180px, 0.8fr) minmax(240px, 1.2fr) auto; align-items: center; gap: 14px; width: min(800px, calc(100% - 64px)); margin: 0 auto 12px; padding: 14px; border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); border-radius: 16px; background: var(--surface); box-shadow: 0 12px 32px rgba(74, 47, 51, 0.07); }
+.transcript-confirmation .eyebrow { margin-bottom: 3px; }
+.transcript-confirmation strong { display: block; font-size: 11px; line-height: 1.45; font-weight: 550; }
+.transcript-confirmation textarea { width: 100%; resize: vertical; padding: 9px 10px; border: 1px solid rgba(105, 81, 87, 0.14); border-radius: 10px; outline: 0; background: color-mix(in srgb, var(--surface) 82%, transparent); color: var(--text); line-height: 1.5; }
+.transcript-confirmation textarea:focus { border-color: color-mix(in srgb, var(--accent) 58%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent); }
+.transcript-confirmation__actions { display: flex; gap: 7px; }
+.transcript-confirmation__actions .primary-button, .transcript-confirmation__actions .secondary-button { min-height: 36px; padding-inline: 12px; white-space: nowrap; }
+.speech-button { margin-top: 7px; padding: 3px 0; border: 0; background: transparent; color: var(--accent); cursor: pointer; font-size: 10px; font-weight: 650; }
+.speech-button--playing { color: #b75b5b; }
+@keyframes recording-pulse { 50% { box-shadow: 0 0 0 8px rgba(183, 91, 91, 0.05); } }
 
 .empty-page { min-height: 100vh; display: grid; place-content: center; justify-items: center; text-align: center; }
 .empty-page__mark { color: var(--accent); font-size: 28px; }
 .empty-page h1 { margin-top: 12px; font-size: 30px; }
 .empty-page p { color: #8c7d7f; font-size: 13px; }
+
+.management-page { min-height: 100vh; padding: 34px 38px 48px; }
+.management-page .page-heading { max-width: 940px; }
+.page-notice { max-width: 940px; margin: -8px 0 16px; padding: 10px 13px; border: 1px solid rgba(183, 91, 91, 0.18); border-radius: 11px; background: rgba(183, 91, 91, 0.08); color: #a94f4f; font-size: 12px; }
+.management-loading { max-width: 940px; margin: 56px auto; color: var(--muted); text-align: center; font-size: 12px; }
+.empty-management { max-width: 620px; margin: 82px auto; text-align: center; }
+.empty-management > span { color: var(--accent); font-size: 28px; }
+.empty-management h2 { margin: 12px 0 7px; font-family: Georgia, "Songti SC", serif; font-size: 21px; font-weight: 500; }
+.empty-management p { margin: 0; color: var(--muted); font-size: 12px; }
+.memory-list, .schedule-groups { display: grid; max-width: 940px; gap: 12px; }
+.management-card { border: 1px solid rgba(91, 66, 70, 0.11); border-radius: 16px; background: var(--surface); box-shadow: 0 10px 30px rgba(64, 44, 48, 0.04); }
+.memory-card, .schedule-card { display: flex; align-items: center; gap: 18px; padding: 17px 18px; }
+.management-card__body { min-width: 0; flex: 1; }
+.management-card__body > p { margin: 0 0 8px; line-height: 1.65; font-size: 14px; white-space: pre-wrap; }
+.management-card__body small, .schedule-card__time small { display: block; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.management-card__body textarea { width: 100%; resize: vertical; padding: 9px 11px; border: 1px solid rgba(105, 81, 87, 0.16); border-radius: 10px; outline: 0; background: color-mix(in srgb, var(--surface) 82%, transparent); color: var(--text); line-height: 1.55; }
+.management-card__body textarea:focus { border-color: color-mix(in srgb, var(--accent) 58%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent); }
+.management-card__actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
+.management-card__actions .primary-button { min-height: 36px; padding-inline: 15px; }
+.management-card__actions .secondary-button { min-height: 36px; }
+.text-button { padding: 6px 4px; border: 0; background: transparent; color: var(--accent); cursor: pointer; font-size: 11px; font-weight: 650; }
+.text-button:disabled { cursor: default; opacity: 0.55; }
+.text-button--danger { color: #b75b5b; }
+
+.schedule-form { max-width: 940px; margin-bottom: 28px; padding: 20px; }
+.schedule-form__heading, .schedule-form__actions { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.schedule-form__heading h2 { margin: 10px 0 0; font-family: Georgia, "Songti SC", serif; font-size: 18px; font-weight: 500; }
+.schedule-form__fields { display: grid; grid-template-columns: minmax(180px, 1.35fr) repeat(2, minmax(150px, 1fr)); gap: 10px; margin-top: 16px; }
+.schedule-form label { display: grid; gap: 6px; color: var(--muted); font-size: 10px; }
+.schedule-form input, .schedule-form select { width: 100%; min-height: 40px; padding: 0 11px; border: 1px solid rgba(105, 81, 87, 0.14); border-radius: 10px; outline: 0; background: color-mix(in srgb, var(--surface) 82%, transparent); color: var(--text); }
+.schedule-form input:focus, .schedule-form select:focus { border-color: color-mix(in srgb, var(--accent) 58%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent); }
+.schedule-form__actions { margin-top: 17px; padding-top: 15px; border-top: 1px solid rgba(91, 66, 70, 0.09); }
+.schedule-form__actions small { color: var(--muted); font-size: 10px; line-height: 1.5; }
+.schedule-form__actions .primary-button { min-height: 38px; white-space: nowrap; }
+.schedule-groups { gap: 24px; }
+.schedule-group > h2 { margin: 0 0 10px; color: var(--muted); font-size: 12px; font-weight: 650; }
+.schedule-group { display: grid; gap: 8px; }
+.schedule-card__time { width: 164px; flex: 0 0 auto; padding-right: 16px; border-right: 1px solid rgba(91, 66, 70, 0.1); }
+.schedule-card__time strong { display: block; margin-bottom: 5px; color: var(--accent); font-size: 11px; line-height: 1.45; }
 
 .window-mode, .secondary-button, .primary-button {
   border: 0;
@@ -233,8 +295,15 @@ nav { display: grid; gap: 7px; }
   .topbar { padding-inline: 24px; }
   .status { display: none; }
   .conversation, .composer { width: calc(100% - 34px); }
+  .transcript-confirmation { grid-template-columns: 1fr; width: calc(100% - 34px); }
+  .transcript-confirmation__actions { justify-content: flex-end; }
   .settings-page { padding: 26px 22px 40px; }
+  .management-page { padding: 26px 22px 40px; }
   .settings-grid { grid-template-columns: 1fr; }
+  .schedule-form__fields { grid-template-columns: 1fr; }
+  .memory-card, .schedule-card { align-items: flex-start; flex-wrap: wrap; }
+  .management-card__actions { margin-left: auto; }
+  .schedule-card__time { width: 100%; padding: 0 0 10px; border-right: 0; border-bottom: 1px solid rgba(91, 66, 70, 0.1); }
   .onboarding-grid { grid-template-columns: 1fr; }
   .onboarding-heading { gap: 20px; }
 }

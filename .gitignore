@@ -4,6 +4,7 @@ dist/
 native/sqlite/
 target/
 src-tauri/target/
+src-tauri/gen/schemas/macOS-schema.json
 *.log
 .DS_Store
 .idea/
