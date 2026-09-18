@@ -27,7 +27,6 @@ export interface BootstrapResponse {
 export interface PersonaProfile {
   name: string;
   personality: string;
-  speechStyle: string;
 }
 
 export interface AppSettings {
@@ -37,6 +36,17 @@ export interface AppSettings {
   dndEnd: string | null;
   voiceAutoplay: boolean;
   proactiveEnabled: boolean;
+  ttsVoice: string;
+  ttsRate: number;
+  ttsPitch: number;
+  ttsVolume: number;
+}
+
+export interface TtsOptions {
+  voice: string;
+  rate: number;
+  pitch: number;
+  volume: number;
 }
 
 export type WindowMode = "compact" | "management";
@@ -156,6 +166,22 @@ export async function setWindowMode(mode: WindowMode): Promise<void> {
   return invoke<void>("set_window_mode", { mode });
 }
 
+export async function openChatWindow(): Promise<void> {
+  return invoke<void>("open_chat_window");
+}
+
+export async function openSettingsWindow(): Promise<void> {
+  return invoke<void>("open_settings_window");
+}
+
+export async function finishOnboarding(): Promise<void> {
+  return invoke<void>("finish_onboarding");
+}
+
+export async function clearConversationData(): Promise<void> {
+  return invoke<void>("clear_conversation_data");
+}
+
 export async function getApiProfileStatus(
   capability: ApiCapability,
 ): Promise<ApiProfileStatus | null> {
@@ -190,11 +216,8 @@ export async function transcribeAudio(
   return invoke<TranscriptionResult>("transcribe_audio", { audio, fileName, mimeType });
 }
 
-export async function synthesizeSpeech(
-  text: string,
-  voice?: string,
-): Promise<SpeechSynthesisResult> {
-  return invoke<SpeechSynthesisResult>("synthesize_speech", { text, voice });
+export async function synthesizeSpeech(text: string, options?: TtsOptions): Promise<SpeechSynthesisResult> {
+  return invoke<SpeechSynthesisResult>("synthesize_speech", { text, options });
 }
 
 export async function listMemories(): Promise<MemoryRecord[]> {

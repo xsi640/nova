@@ -12,14 +12,28 @@
   "app": {
     "windows": [
       {
-        "label": "main",
-        "title": "Nova",
-        "width": 1080,
+        "label": "settings",
+        "title": "Nova 设置",
+        "width": 1120,
         "height": 760,
-        "minWidth": 760,
-        "minHeight": 560,
+        "minWidth": 920,
+        "minHeight": 680,
         "center": true,
-        "resizable": true
+        "resizable": true,
+        "decorations": false
+      },
+      {
+        "label": "chat",
+        "title": "Nova",
+        "width": 440,
+        "height": 640,
+        "minWidth": 400,
+        "minHeight": 600,
+        "center": true,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "visible": false
       }
     ],
     "security": {
@@ -30,4 +44,3 @@
     "active": false
   }
 }
-

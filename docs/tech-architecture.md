@@ -11,7 +11,7 @@
 - 聊天、记忆、日程、角色设定和应用设置仅保存于本机 SQLite 数据库；第一版不设置数据库密码，也不加密数据库文件。
 - API Key 可在设置页配置、修改和测试，但明文只能保存在操作系统凭据存储中。
 - 低频输入检测只产生空闲状态和持续时间，不采集键盘内容、鼠标位置或具体操作。
-- 对话、语音识别和语音合成均支持独立的 OpenAI 兼容 API 配置，且可复用同一 API Key。
+- 对话和语音识别支持独立的 OpenAI 兼容 API 配置，且可复用同一 API Key；语音合成固定使用 Rust 实现的 Edge TTS，设置页提供音色、语速、音调和音量配置。
 - 第一版只要求开发环境直接运行，不产出安装包。
 
 ## 2. 交付形态与运行环境
@@ -24,7 +24,7 @@
 | macOS 运行环境 | macOS 13+、Apple Silicon 或 Intel、Xcode Command Line Tools |
 | 前端运行环境 | Node.js 24.14.0、npm 11.9.0 |
 | 本地启动方式 | `npm run tauri dev` |
-| 远端依赖 | 用户自行配置的 OpenAI 兼容 API |
+| 远端依赖 | 用户自行配置的对话/语音识别 OpenAI 兼容 API，以及 Edge TTS 在线服务 |
 | 数据位置 | 应用数据目录中的明文 SQLite 数据库 |
 
 Windows 开发依赖 Microsoft C++ Build Tools 与 WebView2；macOS 开发需要 Xcode Command Line Tools。Tauri 官方前置条件说明了这些平台依赖。[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
@@ -57,7 +57,7 @@ React UI
             └─ Windows/macOS 平台适配器
 ```
 
-- **React UI 层**：实现已确认的聊天浮窗、首次引导、记忆、日程和设置页面；不保存 API Key，不直接访问数据库或远端 API。
+- **React UI 层**：实现已确认的聊天浮窗、记忆、日程和设置页面；设置页可清除聊天记录与记忆，不保存 API Key，不直接访问数据库或远端 API。
 - **Tauri 命令边界**：仅暴露业务命令和受控应用事件，不将数据库连接、系统密钥或 HTTP 客户端泄露给前端。
 - **Rust 应用服务层**：编排对话、语音、记忆、日程、主动陪伴、设置和导出流程。
 - **基础设施与平台适配层**：实现 SQLite、系统凭据、HTTP、系统空闲时长、托盘、窗口与通知。
@@ -66,7 +66,7 @@ React UI
 
 | 代码模块 | 需求模块 | 前端职责 | Rust 职责 |
 |---|---|---|---|
-| MODULE-001 | 虚拟女友设定 | 首次设定与设置页 | 保存、读取和校验姓名、性格、说话方式 |
+| MODULE-001 | 虚拟女友设定 | 首次设定与设置页 | 保存、读取和校验姓名与多项性格；说话方式由性格推导 |
 | MODULE-002 | 对话交互 | 长期聊天页、文字输入、语音识别确认、语音播放 | 保存消息、调用对话 API、调用识别与合成 API |
 | MODULE-003 | 长期记忆 | 记忆列表、来源消息、编辑、删除、导出 | 自动提取候选记忆、关联来源消息、持久化与查询 |
 | MODULE-004 | 主动陪伴 | 主动消息在聊天时间线中的展示 | 只检测空闲时长、检查免打扰、生成与保存消息、触发通知 |
@@ -89,13 +89,13 @@ React UI
 
 | 实体 | 关键字段 | 说明 |
 |---|---|---|
-| persona_profile | id、name、personality、speech_style、updated_at | 当前虚拟女友设定 |
-| api_profiles | id、capability、base_url、model、secret_ref、enabled | 对话、语音识别、语音合成三类服务的非敏感配置 |
+| persona_profile | id、name、personality、speech_style、updated_at | 当前虚拟女友设定；`speech_style` 仅为旧数据兼容字段，不再由用户配置 |
+| api_profiles | id、capability、base_url、model、secret_ref、enabled | 对话和语音识别服务的非敏感配置；旧版本语音合成记录仅为迁移兼容 |
 | chat_messages | id、role、content、audio_ref、created_at、status | 单一连续聊天时间线中的消息 |
 | memories | id、content、source_message_id、created_at、updated_at | 自动形成且可人工管理的长期记忆 |
 | schedules | id、title、scheduled_at、remind_at、source_message_id、status | 应用内日程及其提醒状态 |
 | proactive_events | id、message_id、idle_started_at、notified_at、opened_at | 主动陪伴消息与通知状态 |
-| app_settings | theme、dark_mode、dnd_start、dnd_end、voice_autoplay | 非敏感应用行为设置 |
+| app_settings | theme、dark_mode、dnd_start、dnd_end、voice_autoplay、tts_voice、tts_rate、tts_pitch、tts_volume、onboarding_required | 非敏感应用行为、Edge TTS 设置及保留的恢复引导状态 |
 
 ### 本地存储与密钥策略
 
@@ -120,13 +120,13 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 
 | 类型 | 本地命令类别 | 对应模块 | 用途 |
 |---|---|---|---|
-| 本地命令 | bootstrap、get_onboarding_status | MODULE-001、MODULE-008 | 读取首次启动状态 |
+| 本地命令 | bootstrap | MODULE-001、MODULE-008 | 读取窗口状态及数据清空后是否需要引导 |
 | 本地命令 | save_persona、get_persona | MODULE-001 | 管理虚拟女友设定 |
 | 本地命令 | send_message、transcribe_audio、synthesize_speech | MODULE-002 | 文字与语音交互 |
 | 本地命令 | list_memories、update_memory、delete_memory、export_data | MODULE-003、MODULE-006 | 管理与导出数据 |
 | 本地命令 | confirm_schedule、list_schedules、update_schedule、delete_schedule | MODULE-005 | 管理应用内日程 |
 | 本地命令 | save_api_profile、test_api_profile、get_api_profile_status | MODULE-008 | 配置、测试和读取脱敏 API 状态 |
-| 本地命令 | save_settings、get_settings | MODULE-004、MODULE-007 | 管理免打扰、主题和语音播放设置 |
+| 本地命令 | save_settings、get_settings | MODULE-004、MODULE-007 | 管理免打扰、主题、语音播放和 Edge TTS 设置 |
 
 ### 远端 API 适配
 
@@ -134,9 +134,9 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 |---|---|---|
 | 对话 | `POST /chat/completions` | base URL、路径、模型、API Key 引用 |
 | 语音识别 | `POST /audio/transcriptions` | base URL、路径、模型、API Key 引用 |
-| 语音合成 | `POST /audio/speech` | base URL、路径、模型、API Key 引用 |
+| 语音合成 | Edge TTS WebSocket | Edge 音色、语速、音调、音量；无需 API Key |
 
-- 三类能力各有配置资料，允许它们指向同一供应商或不同供应商。
+- 对话和语音识别各有配置资料，允许它们指向同一供应商或不同供应商；语音合成不创建自定义 API 配置。
 - 远端请求统一由 Rust 发送，并使用 `Authorization: Bearer <API Key>`。
 - API 连接测试不在日志中记录 API Key。
 - 统一错误模型包含：配置错误、网络错误、授权错误、服务响应错误、音频错误、数据库错误和平台权限错误。
@@ -159,11 +159,11 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 | ADR-004 | 远端 API 调用位置 | React 不应持有 API Key | Rust 服务层统一调用 | React 直连远端 API | 会暴露密钥并导致错误处理分散 |
 | ADR-005 | 主动陪伴输入检测 | 需要判断低频操作且保护隐私 | 仅采集空闲状态与持续时间 | 键盘监听内容；鼠标轨迹采集 | 超出需求且侵犯隐私 |
 | ADR-006 | 服务端与同步 | 第一版为单用户、本地使用 | 不建设服务端、账号与云同步 | 自建云端后端 | 超出当前范围并增加维护成本 |
-| ADR-007 | 语音与对话配置 | 三类模型能力可能来自不同兼容服务 | 独立配置资料，可复用同一 Key | 强制单一服务配置 | 限制兼容供应商与模型选择 |
+| ADR-007 | 语音与对话配置 | 对话和识别可能来自不同兼容服务；免费 TTS 需要避免额外 Key | 对话/识别独立配置；TTS 固定 Edge TTS 并开放音色、语速、音调、音量 | 自定义 OpenAI 兼容 TTS；完全离线 TTS | 当前阶段优先减少配置复杂度，后续再评估离线语音 |
 
 ## 9. 技术风险
 
-- OpenAI 兼容服务对聊天、语音识别和语音合成端点的兼容程度不同；连接测试必须按能力分别执行。
+- OpenAI 兼容服务对聊天和语音识别端点的兼容程度不同；连接测试必须按能力分别执行。Edge TTS 依赖在线端点，可能受网络或服务端变更影响。
 - 明文 SQLite 数据库包含敏感对话信息；拥有本机文件访问权限的其他程序可能直接读取数据。
 - Windows/macOS 的空闲时长检测、通知权限和凭据存储 API 不同，应保持在 MODULE-007 与 MODULE-008 的平台适配边界内。
 - 外部 API 不可用会影响对话与语音能力；本地聊天、记忆、日程和设置必须仍可读取。
@@ -187,7 +187,7 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 ## 11. 人工确认结论
 
 - 用户已确认 Tauri + React + Rust 方案，且明确要求当前阶段不进行编码。
-- 用户已确认对话、语音识别和语音合成采用可配置的 OpenAI 兼容 API。
+- 用户已确认对话和语音识别采用可配置的 OpenAI 兼容 API；语音合成暂固定使用 Edge TTS，并通过设置页配置音色、语速、音调和音量。
 - 用户已确认 API Key 继续由设置页配置；系统凭据存储负责保存密钥，Rust 服务层负责实际调用。
 - 用户已确认 Windows 10/11 x64 与 macOS 13+ Apple Silicon/Intel 支持范围。
 - 用户已确认第一版使用明文 SQLite，不设置数据库密码。

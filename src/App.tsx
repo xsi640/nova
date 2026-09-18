@@ -1,23 +1,29 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   bootstrap,
   getApiProfileStatus,
   getPersona,
   getSettings,
   confirmSchedule,
+  clearConversationData,
   deleteMemory,
   deleteSchedule,
   exportLocalData,
+  finishOnboarding,
   getScheduleCandidate,
   listMemories,
   listMessages,
   listSchedules,
+  openSettingsWindow,
   retryMessage,
   saveApiProfile,
   savePersona,
   saveSettings,
   sendMessage,
-  setWindowMode,
   showNotification,
   synthesizeSpeech,
   testApiProfile,
@@ -38,40 +44,124 @@ import {
   type ScheduleStatus,
   updateMemory,
   updateSchedule,
-  type WindowMode,
 } from "./lib/commands";
 
-type Page = "chat" | "memory" | "schedule" | "settings";
+type Page = "memory" | "schedule" | "settings";
 
 const navigation: Array<{ id: Page; label: string; glyph: string }> = [
-  { id: "chat", label: "聊天", glyph: "✦" },
   { id: "memory", label: "记忆", glyph: "◇" },
   { id: "schedule", label: "日程", glyph: "□" },
   { id: "settings", label: "设置", glyph: "⚙" },
 ];
 
 const defaultSettings: AppSettings = {
-  theme: "rose",
+  theme: "lavender",
   darkMode: false,
   dndStart: "23:00",
   dndEnd: "08:00",
   voiceAutoplay: true,
   proactiveEnabled: true,
+  ttsVoice: "zh-CN-XiaoxiaoNeural",
+  ttsRate: -5,
+  ttsPitch: 0,
+  ttsVolume: 0,
 };
 
 const defaultPersona: PersonaProfile = {
   name: "小诺",
   personality: "温柔、爱倾听、有一点俏皮",
-  speechStyle: "自然、轻松，偶尔带一点可爱的语气",
 };
 
-const apiCapabilityMeta: Record<ApiCapability, { label: string; path: string; model: string }> = {
+const personalityOptions = [
+  "温柔",
+  "体贴",
+  "爱倾听",
+  "活泼",
+  "俏皮",
+  "理性",
+  "成熟",
+  "幽默",
+  "安静",
+  "直率",
+] as const;
+
+function personalityValue(value: string) {
+  const parts = value.split(/[、，,]/).map((part) => part.trim()).filter(Boolean);
+  const selected = personalityOptions.filter((option) => parts.includes(option));
+  const custom = parts.filter((part) => !personalityOptions.includes(part as typeof personalityOptions[number])).join("、");
+  return { selected, custom };
+}
+
+function PersonalityPicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const { selected, custom } = personalityValue(value);
+  function commit(nextSelected: readonly string[], nextCustom = custom) {
+    onChange([...nextSelected, nextCustom.trim()].filter(Boolean).join("、"));
+  }
+
+  return (
+    <div className="personality-picker">
+      <div className="personality-picker__head">
+        <strong>性格</strong>
+        <small>可多选，最多 5 项</small>
+      </div>
+      <div className="personality-options">
+        {personalityOptions.map((option) => {
+          const active = selected.includes(option);
+          return (
+            <button
+              aria-pressed={active}
+              className={active ? "personality-chip is-selected" : "personality-chip"}
+              disabled={!active && selected.length >= 5}
+              key={option}
+              onClick={() => commit(active ? selected.filter((item) => item !== option) : [...selected, option])}
+              type="button"
+            >
+              {option}
+            </button>
+          );
+        })}
+      </div>
+      <label className="personality-custom">
+        <span>自定义</span>
+        <input
+          maxLength={80}
+          placeholder="例如：有一点小傲娇"
+          value={custom}
+          onChange={(event) => commit(selected, event.target.value)}
+        />
+      </label>
+    </div>
+  );
+}
+
+function WindowChrome() {
+  const appWindow = getCurrentWindow();
+  const run = (action: () => Promise<void>) => void action().catch(() => undefined);
+  return (
+    <header className="window-chrome">
+      <div className="window-chrome__brand"><span>✦</span> Nova</div>
+      <div
+        className="window-chrome__drag"
+        data-tauri-drag-region
+        onDoubleClick={() => run(() => appWindow.toggleMaximize())}
+      />
+      <div className="window-controls">
+        <button aria-label="最小化" onClick={() => run(() => appWindow.minimize())} type="button">—</button>
+        <button aria-label="最大化或还原" onClick={() => run(() => appWindow.toggleMaximize())} type="button">□</button>
+        <button aria-label="关闭" className="window-control--close" onClick={() => run(() => appWindow.close())} type="button">×</button>
+      </div>
+    </header>
+  );
+}
+
+type ApiServiceCapability = Exclude<ApiCapability, "speech">;
+
+const apiCapabilityMeta: Record<ApiServiceCapability, { label: string; path: string; model: string }> = {
   chat: { label: "对话", path: "/chat/completions", model: "gpt-4.1-mini" },
   transcription: { label: "语音识别", path: "/audio/transcriptions", model: "gpt-4o-mini-transcribe" },
-  speech: { label: "语音合成", path: "/audio/speech", model: "gpt-4o-mini-tts" },
 };
 
-function emptyApiProfile(capability: ApiCapability): ApiProfileInput {
+function emptyApiProfile(capability: ApiServiceCapability): ApiProfileInput {
   const defaults = apiCapabilityMeta[capability];
   return {
     capability,
@@ -108,6 +198,22 @@ function errorMessage(error: unknown): string {
   return "保存失败，请稍后重试";
 }
 
+function MarkdownMessage({ content }: { content: string }) {
+  return (
+    <div className="markdown-message">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        skipHtml
+        components={{
+          a: ({ href, children }) => <a href={href} rel="noreferrer" target="_blank">{children}</a>,
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function StatusPill({ status }: { status: BootstrapResponse | null }) {
   const ready = status?.databaseReady ?? false;
   return (
@@ -118,10 +224,10 @@ function StatusPill({ status }: { status: BootstrapResponse | null }) {
   );
 }
 
-function WindowModeButton({ mode, onChange }: { mode: WindowMode; onChange: () => void }) {
+function WindowModeButton({ onChange }: { onChange: () => void }) {
   return (
-    <button className="window-mode" type="button" onClick={onChange}>
-      {mode === "compact" ? "打开管理页" : "切换聊天浮窗"}
+    <button aria-label="打开设置" className="window-mode" type="button" onClick={onChange}>
+      <span aria-hidden="true">⚙</span>
     </button>
   );
 }
@@ -369,15 +475,11 @@ function SchedulePage() {
 function ChatPage({
   status,
   persona,
-  windowMode,
-  onWindowModeChange,
   onOpenSettings,
   settings,
 }: {
   status: BootstrapResponse | null;
   persona: PersonaProfile | null;
-  windowMode: WindowMode;
-  onWindowModeChange: () => void;
   onOpenSettings: () => void;
   settings: AppSettings;
 }) {
@@ -399,6 +501,7 @@ function ChatPage({
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const speechCacheRef = useRef(new Map<number, { audioBase64: string; contentType: string }>());
 
   useEffect(() => {
     let active = true;
@@ -448,7 +551,9 @@ function ChatPage({
     setSpeakingMessageId(message.id);
     let audio: HTMLAudioElement | null = null;
     try {
-      const result = await synthesizeSpeech(message.content);
+      const cached = speechCacheRef.current.get(message.id);
+      const result = cached ?? await synthesizeSpeech(message.content);
+      if (!cached) speechCacheRef.current.set(message.id, result);
       audio = new Audio(`data:${result.contentType};base64,${result.audioBase64}`);
       audioRef.current = audio;
       audio.onended = () => {
@@ -658,13 +763,16 @@ function ChatPage({
   return (
     <section className="chat-page">
       <header className="topbar">
-        <div>
-          <p className="eyebrow">一直都在</p>
-          <h1>晚上好，我是 {name}</h1>
+        <div className="topbar__identity">
+          <div className="avatar">✦</div>
+          <div>
+            <h1>{name}</h1>
+            <p className="eyebrow">● 正在陪伴你</p>
+          </div>
         </div>
         <div className="topbar__actions">
           <StatusPill status={status} />
-          <WindowModeButton mode={windowMode} onChange={onWindowModeChange} />
+          <WindowModeButton onChange={onOpenSettings} />
         </div>
       </header>
 
@@ -678,7 +786,7 @@ function ChatPage({
             <div>
               <p className="message__name">{name}</p>
               <div className="bubble">
-                <p>嗨，我已经准备好了。想从今天发生的哪件小事聊起？</p>
+                <MarkdownMessage content="嗨，我已经准备好了。想从今天发生的哪件小事聊起？" />
               </div>
             </div>
           </article>
@@ -691,7 +799,7 @@ function ChatPage({
               <div className="message__content">
                 {isAssistant && <p className="message__name">{name}</p>}
                 <div className="bubble">
-                  <p>{message.content}</p>
+                  <MarkdownMessage content={message.content} />
                 </div>
                 {isAssistant && message.status === "sent" && (
                   <button
@@ -793,14 +901,13 @@ function ApiSettingsCard({ chatOnly = false, onChatReadyChange }: {
   chatOnly?: boolean;
   onChatReadyChange?: (ready: boolean) => void;
 }) {
-  const capabilities = chatOnly ? (["chat"] as ApiCapability[]) : Object.keys(apiCapabilityMeta) as ApiCapability[];
-  const [selected, setSelected] = useState<ApiCapability>("chat");
-  const [profiles, setProfiles] = useState<Record<ApiCapability, ApiProfileInput>>({
+  const capabilities = chatOnly ? (["chat"] as ApiServiceCapability[]) : Object.keys(apiCapabilityMeta) as ApiServiceCapability[];
+  const [selected, setSelected] = useState<ApiServiceCapability>("chat");
+  const [profiles, setProfiles] = useState<Record<ApiServiceCapability, ApiProfileInput>>({
     chat: emptyApiProfile("chat"),
     transcription: emptyApiProfile("transcription"),
-    speech: emptyApiProfile("speech"),
   });
-  const [savedStatuses, setSavedStatuses] = useState<Partial<Record<ApiCapability, ApiProfileStatus>>>({});
+  const [savedStatuses, setSavedStatuses] = useState<Partial<Record<ApiServiceCapability, ApiProfileStatus>>>({});
   const [notice, setNotice] = useState("尚未配置");
   const [busy, setBusy] = useState<"save" | "test" | null>(null);
   const profile = profiles[selected];
@@ -811,7 +918,7 @@ function ApiSettingsCard({ chatOnly = false, onChatReadyChange }: {
       .then((entries) => {
         if (!active) return;
         const nextProfiles = { ...profiles };
-        const nextStatuses: Partial<Record<ApiCapability, ApiProfileStatus>> = {};
+        const nextStatuses: Partial<Record<ApiServiceCapability, ApiProfileStatus>> = {};
         for (const [capability, status] of entries) {
           if (!status) continue;
           nextStatuses[capability] = status;
@@ -919,13 +1026,109 @@ function ApiSettingsCard({ chatOnly = false, onChatReadyChange }: {
   );
 }
 
+const edgeVoiceOptions = [
+  ["zh-CN-XiaoxiaoNeural", "晓晓 · 女声"],
+  ["zh-CN-XiaoyiNeural", "晓伊 · 女声"],
+  ["zh-CN-XiaohanNeural", "晓涵 · 女声"],
+  ["zh-CN-YunxiNeural", "云希 · 男声"],
+  ["zh-CN-YunjianNeural", "云健 · 男声"],
+  ["zh-CN-YunyangNeural", "云扬 · 男声"],
+] as const;
+
+function adjustmentLabel(value: number, lower: string, higher: string): string {
+  if (value === 0) return "刚好";
+  return value < 0 ? lower : higher;
+}
+
+function TtsSettingsCard({ settings, onChange }: {
+  settings: AppSettings;
+  onChange: (changes: Partial<AppSettings>) => void;
+}) {
+  const [previewing, setPreviewing] = useState(false);
+  const [previewNotice, setPreviewNotice] = useState<string | null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => () => previewAudioRef.current?.pause(), []);
+
+  function stopPreview() {
+    previewAudioRef.current?.pause();
+    previewAudioRef.current = null;
+    setPreviewing(false);
+  }
+
+  async function previewVoice() {
+    stopPreview();
+    setPreviewing(true);
+    setPreviewNotice(null);
+    try {
+      const result = await synthesizeSpeech("你好呀，想和你聊聊今天吗？", {
+        voice: settings.ttsVoice,
+        rate: settings.ttsRate,
+        pitch: settings.ttsPitch,
+        volume: settings.ttsVolume,
+      });
+      const audio = new Audio(`data:${result.contentType};base64,${result.audioBase64}`);
+      previewAudioRef.current = audio;
+      audio.onended = () => {
+        if (previewAudioRef.current === audio) {
+          previewAudioRef.current = null;
+          setPreviewing(false);
+        }
+      };
+      audio.onerror = () => {
+        if (previewAudioRef.current === audio) {
+          previewAudioRef.current = null;
+          setPreviewing(false);
+          setPreviewNotice("试听没有成功，再试一次吧");
+        }
+      };
+      await audio.play();
+    } catch (error) {
+      previewAudioRef.current = null;
+      setPreviewing(false);
+      setPreviewNotice(errorMessage(error));
+    }
+  }
+
+  return (
+    <section className="settings-card tts-card">
+      <span className="section-tag">语音播放</span>
+      <h2>声音</h2>
+      <label>
+        <span>声音</span>
+        <select value={settings.ttsVoice} onChange={(event) => onChange({ ttsVoice: event.target.value })}>
+          {edgeVoiceOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+        </select>
+      </label>
+      <div className="tts-control">
+        <div className="tts-control__head"><strong>语速</strong><output>{adjustmentLabel(settings.ttsRate, "慢一点", "快一点")}</output></div>
+        <input aria-label="语速" max={100} min={-50} onChange={(event) => onChange({ ttsRate: Number(event.target.value) })} step={5} type="range" value={settings.ttsRate} />
+      </div>
+      <div className="tts-control">
+        <div className="tts-control__head"><strong>声调</strong><output>{adjustmentLabel(settings.ttsPitch, "低一点", "高一点")}</output></div>
+        <input aria-label="声调" max={50} min={-50} onChange={(event) => onChange({ ttsPitch: Number(event.target.value) })} step={5} type="range" value={settings.ttsPitch} />
+      </div>
+      <div className="tts-control">
+        <div className="tts-control__head"><strong>音量</strong><output>{adjustmentLabel(settings.ttsVolume, "小一点", "大一点")}</output></div>
+        <input aria-label="音量" max={50} min={-50} onChange={(event) => onChange({ ttsVolume: Number(event.target.value) })} step={5} type="range" value={settings.ttsVolume} />
+      </div>
+      <div className="tts-preview">
+        <button className="secondary-button" onClick={() => previewing ? stopPreview() : void previewVoice()} type="button">
+          {previewing ? "停止试听" : "试听一下"}
+        </button>
+        {previewNotice && <span role="alert">{previewNotice}</span>}
+      </div>
+    </section>
+  );
+}
+
 function OnboardingPage({ persona, onPersonaSaved, onComplete }: {
   persona: PersonaProfile | null;
   onPersonaSaved: (persona: PersonaProfile) => void;
-  onComplete: () => void;
+  onComplete: () => Promise<void>;
 }) {
   const [draft, setDraft] = useState(persona ?? defaultPersona);
-  const [personaReady, setPersonaReady] = useState(Boolean(persona));
+  const [step, setStep] = useState<1 | 2>(persona ? 2 : 1);
   const [chatReady, setChatReady] = useState(false);
   const [notice, setNotice] = useState(persona ? "角色设定已保存" : "先让她认识你一点");
   const [saving, setSaving] = useState(false);
@@ -937,8 +1140,8 @@ function OnboardingPage({ persona, onPersonaSaved, onComplete }: {
       const saved = await savePersona(draft);
       onPersonaSaved(saved);
       setDraft(saved);
-      setPersonaReady(true);
       setNotice("角色设定已保存");
+      setStep(2);
     } catch (error) {
       setNotice(errorMessage(error));
     } finally {
@@ -951,49 +1154,39 @@ function OnboardingPage({ persona, onPersonaSaved, onComplete }: {
       <header className="onboarding-heading">
         <div>
           <p className="eyebrow">欢迎来到 Nova</p>
-          <h1>让她先认识你一点</h1>
-          <p>完成角色设定并测试对话 API，之后就能开始聊天。</p>
+          <h1>{step === 1 ? "设置你的虚拟伙伴" : "连接 OpenAI 兼容接口"}</h1>
+          <p>{step === 1 ? "给她一个名字，再选择最贴近她的性格。" : "保存并测试文字对话接口，成功后即可开始聊天。"}</p>
         </div>
         <div className="step-indicator" aria-label="配置进度">
-          <span className={personaReady ? "is-done" : "is-active"}>1</span>
+          <span className={step === 2 ? "is-done" : "is-active"}>1</span>
           <i />
-          <span className={chatReady ? "is-done" : personaReady ? "is-active" : ""}>2</span>
-          <i />
-          <span className={personaReady && chatReady ? "is-active" : ""}>3</span>
+          <span className={step === 2 ? "is-active" : ""}>2</span>
         </div>
       </header>
 
-      <div className="onboarding-grid">
-        <section className="settings-card onboarding-persona">
-          <span className="section-tag">第一步 · 角色设定</span>
-          <h2>她会怎么陪伴你？</h2>
-          <label><span>名字</span><input maxLength={32} value={draft.name} onChange={(event) => {
-            setDraft({ ...draft, name: event.target.value }); setPersonaReady(false);
-          }} /></label>
-          <label><span>性格</span><textarea maxLength={240} rows={3} value={draft.personality} onChange={(event) => {
-            setDraft({ ...draft, personality: event.target.value }); setPersonaReady(false);
-          }} /></label>
-          <label><span>说话方式</span><textarea maxLength={240} rows={3} value={draft.speechStyle} onChange={(event) => {
-            setDraft({ ...draft, speechStyle: event.target.value }); setPersonaReady(false);
-          }} /></label>
-          <div className="onboarding-action">
-            <span>{notice}</span>
-            <button className="primary-button" disabled={saving} onClick={() => void savePersonaStep()} type="button">
-              {saving ? "保存中…" : personaReady ? "重新保存" : "保存角色设定"}
-            </button>
+      <div className="onboarding-grid onboarding-grid--single">
+        {step === 1 ? (
+          <section className="settings-card onboarding-persona">
+            <span className="section-tag">第一步 · 虚拟伙伴</span>
+            <h2>她是什么样的人？</h2>
+            <label><span>名字</span><input maxLength={32} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
+            <PersonalityPicker value={draft.personality} onChange={(personality) => setDraft({ ...draft, personality })} />
+            <div className="onboarding-action">
+              <span>{notice}</span>
+              <button className="primary-button" disabled={saving || !draft.name.trim() || !draft.personality.trim()} onClick={() => void savePersonaStep()} type="button">
+                {saving ? "保存中…" : "下一步：配置接口 →"}
+              </button>
+            </div>
+          </section>
+        ) : (
+          <div className="onboarding-step">
+            <ApiSettingsCard chatOnly onChatReadyChange={setChatReady} />
+            <div className="onboarding-navigation">
+              <button className="secondary-button" onClick={() => setStep(1)} type="button">← 返回修改伙伴</button>
+              <button className="primary-button" disabled={!chatReady} onClick={() => void onComplete().catch((error) => setNotice(errorMessage(error)))} type="button">进入聊天 →</button>
+            </div>
           </div>
-        </section>
-
-        <ApiSettingsCard chatOnly onChatReadyChange={setChatReady} />
-
-        <section className="onboarding-finish">
-          <div>
-            <span className="section-tag">第三步 · 准备聊天</span>
-            <h2>从一句话开始</h2>
-            <p>{personaReady && chatReady ? `${draft.name} 已经准备好见你了。` : "完成前两步后，就可以进入长期聊天时间线。"}</p>
-          </div>
-          <button className="primary-button" disabled={!personaReady || !chatReady} onClick={onComplete} type="button">进入聊天 →</button>
-        </section>
+        )}
       </div>
     </section>
   );
@@ -1010,6 +1203,7 @@ function SettingsPage({ settings, persona, onSettingsSaved, onPersonaSaved }: {
   const [notice, setNotice] = useState("所有设置保存在本机");
   const [saving, setSaving] = useState(false);
   const [exporting, setExporting] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const [testingNotification, setTestingNotification] = useState(false);
 
   useEffect(() => setSettingsDraft(settings), [settings]);
@@ -1066,6 +1260,20 @@ function SettingsPage({ settings, persona, onSettingsSaved, onPersonaSaved }: {
     }
   }
 
+  async function clearData() {
+    if (!window.confirm("确定要完全清除记忆和对话记录吗？这些内容无法恢复，角色、日程和设置会保留。")) return;
+    setClearing(true);
+    setNotice("正在清除记忆和对话记录…");
+    try {
+      await clearConversationData();
+      setNotice("记忆和对话记录已清除");
+    } catch (error) {
+      setNotice(errorMessage(error));
+    } finally {
+      setClearing(false);
+    }
+  }
+
   return (
     <section className="settings-page">
       <header className="page-heading">
@@ -1086,17 +1294,14 @@ function SettingsPage({ settings, persona, onSettingsSaved, onPersonaSaved }: {
               <span>名字</span>
               <input maxLength={32} value={personaDraft.name} onChange={(event) => setPersonaDraft({ ...personaDraft, name: event.target.value })} />
             </label>
-            <label>
-              <span>性格</span>
-              <textarea maxLength={240} rows={3} value={personaDraft.personality} onChange={(event) => setPersonaDraft({ ...personaDraft, personality: event.target.value })} />
-            </label>
-            <label>
-              <span>说话方式</span>
-              <textarea maxLength={240} rows={3} value={personaDraft.speechStyle} onChange={(event) => setPersonaDraft({ ...personaDraft, speechStyle: event.target.value })} />
-            </label>
+            <PersonalityPicker value={personaDraft.personality} onChange={(personality) => setPersonaDraft({ ...personaDraft, personality })} />
           </section>
 
           <ApiSettingsCard />
+          <TtsSettingsCard
+            onChange={(changes) => setSettingsDraft({ ...settingsDraft, ...changes })}
+            settings={settingsDraft}
+          />
         </div>
 
         <div className="settings-column">
@@ -1145,11 +1350,18 @@ function SettingsPage({ settings, persona, onSettingsSaved, onPersonaSaved }: {
 
           <section className="settings-card">
             <span className="section-tag">本地数据</span>
-            <h2>导出聊天与记忆</h2>
+            <h2>导出与清除</h2>
             <p>生成可读的 JSON 文件，仅包含聊天记录和记忆，不包含 API Key、服务配置或其他凭据。</p>
             <button className="secondary-button" disabled={exporting} onClick={() => void downloadExport()} type="button">
               {exporting ? "导出中…" : "导出本地数据"}
             </button>
+            <div className="danger-zone">
+              <strong>完全清除记忆和对话记录</strong>
+              <small>只删除聊天记录和记忆；角色、日程、接口配置和声音设置都会保留。</small>
+              <button className="danger-button" disabled={clearing} onClick={() => void clearData()} type="button">
+                {clearing ? "清除中…" : "完全清除记忆和对话记录"}
+              </button>
+            </div>
           </section>
 
           <button className="primary-button" disabled={saving} type="submit">{saving ? "保存中…" : "保存设置"}</button>
@@ -1160,12 +1372,15 @@ function SettingsPage({ settings, persona, onSettingsSaved, onPersonaSaved }: {
 }
 
 export function App() {
-  const [page, setPage] = useState<Page>("chat");
+  const [page, setPage] = useState<Page>("settings");
   const [status, setStatus] = useState<BootstrapResponse | null>(null);
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [persona, setPersona] = useState<PersonaProfile | null>(null);
-  const [windowMode, setWindowModeState] = useState<WindowMode>("management");
+  const [dataResetVersion, setDataResetVersion] = useState(0);
   const [loaded, setLoaded] = useState(false);
+  const windowLabel = getCurrentWindow().label;
+  const isChatWindow = windowLabel === "chat";
+  const isSettingsWindow = windowLabel === "settings";
 
   useEffect(() => {
     let active = true;
@@ -1173,7 +1388,6 @@ export function App() {
       .then(([bootstrapStatus, savedSettings, savedPersona]) => {
         if (!active) return;
         setStatus(bootstrapStatus);
-        setWindowModeState(bootstrapStatus.windowMode);
         setSettings(savedSettings);
         setPersona(savedPersona);
         setLoaded(true);
@@ -1186,12 +1400,42 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    let stopListening: (() => void) | undefined;
+    void listen("nova:conversation-cleared", () => {
+      if (!active) return;
+      setDataResetVersion((current) => current + 1);
+    }).then((stop) => {
+      if (active) stopListening = stop;
+      else stop();
+    });
+    return () => { active = false; stopListening?.(); };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let stopListening: (() => void) | undefined;
+    void listen("nova:onboarding-complete", () => {
+      void Promise.all([bootstrap(), getSettings(), getPersona()]).then(([nextStatus, nextSettings, nextPersona]) => {
+        if (!active) return;
+        setStatus(nextStatus);
+        setSettings(nextSettings);
+        setPersona(nextPersona);
+      });
+    }).then((stop) => {
+      if (active) stopListening = stop;
+      else stop();
+    });
+    return () => { active = false; stopListening?.(); };
+  }, []);
+
+  useEffect(() => {
     document.documentElement.dataset.theme = settings.theme;
     document.documentElement.dataset.colorScheme = settings.darkMode ? "dark" : "light";
   }, [settings.darkMode, settings.theme]);
 
   useEffect(() => {
-    if (!settings.proactiveEnabled) return;
+    if (!isChatWindow || !settings.proactiveEnabled) return;
     const activityKey = "nova:last-activity-at";
     const dispatchKey = "nova:last-proactive-at";
     const markActive = () => localStorage.setItem(activityKey, String(Date.now()));
@@ -1214,9 +1458,10 @@ export function App() {
     events.forEach((event) => document.addEventListener(event, markActive, { passive: true }));
     const timer = window.setInterval(() => void checkIn(), 60_000);
     return () => { events.forEach((event) => document.removeEventListener(event, markActive)); window.clearInterval(timer); };
-  }, [settings.dndEnd, settings.dndStart, settings.proactiveEnabled]);
+  }, [isChatWindow, settings.dndEnd, settings.dndStart, settings.proactiveEnabled]);
 
   useEffect(() => {
+    if (!isChatWindow) return;
     let active = true;
     const dispatchedPrefix = "nova:reminder-dispatched:";
     async function dispatchDueReminders() {
@@ -1240,35 +1485,51 @@ export function App() {
     void dispatchDueReminders();
     const timer = window.setInterval(() => void dispatchDueReminders(), 60_000);
     return () => { active = false; window.clearInterval(timer); };
-  }, []);
-
-  async function toggleWindowMode() {
-    const nextMode: WindowMode = windowMode === "compact" ? "management" : "compact";
-    try {
-      await setWindowMode(nextMode);
-      setWindowModeState(nextMode);
-      if (nextMode === "compact") setPage("chat");
-    } catch {
-      // Keep the current mode if native window resizing is unavailable.
-    }
-  }
+  }, [isChatWindow]);
 
   if (!loaded) {
-    return <main className="loading-screen"><span className="brand__mark">N</span><p>正在准备你的陪伴空间…</p></main>;
+    return <div className="window-root"><WindowChrome /><main className="loading-screen"><span className="brand__mark">N</span><p>正在准备你的陪伴空间…</p></main></div>;
   }
 
-  if (status && !status.onboardingComplete) {
+  if (isSettingsWindow && status && !status.onboardingComplete) {
     return (
-      <OnboardingPage
-        onComplete={() => setStatus({ ...status, onboardingComplete: true })}
-        onPersonaSaved={setPersona}
-        persona={persona}
-      />
+      <div className="window-root">
+        <WindowChrome />
+        <OnboardingPage
+          onComplete={async () => {
+            await finishOnboarding();
+            setStatus({ ...status, onboardingComplete: true });
+          }}
+          onPersonaSaved={setPersona}
+          persona={persona}
+        />
+      </div>
+    );
+  }
+
+  if (isChatWindow) {
+    return (
+      <div className="window-root window-root--chat">
+        <WindowChrome />
+        <main className="app-shell app-shell--compact">
+          <div className="workspace">
+            <ChatPage
+              key={`chat-${dataResetVersion}`}
+              onOpenSettings={() => void openSettingsWindow()}
+              persona={persona}
+              settings={settings}
+              status={status}
+            />
+          </div>
+        </main>
+      </div>
     );
   }
 
   return (
-    <main className={windowMode === "compact" ? "app-shell app-shell--compact" : "app-shell"}>
+    <div className="window-root">
+      <WindowChrome />
+      <main className="app-shell">
       <aside className="sidebar">
         <div className="brand">
           <span className="brand__mark">N</span>
@@ -1282,33 +1543,21 @@ export function App() {
             </button>
           ))}
         </nav>
-
-        <div className="sidebar__footer">
-          <span className="privacy-mark">⌁</span><p>本地优先</p>
-          <small>聊天与设置只保存在这台设备</small>
-        </div>
       </aside>
 
       <div className="workspace">
-        {page === "chat" && (
-          <ChatPage
-            onOpenSettings={() => {
-              if (windowMode === "compact") void toggleWindowMode();
-              setPage("settings");
-            }}
-            onWindowModeChange={() => void toggleWindowMode()}
-            persona={persona}
-            settings={settings}
-            status={status}
-            windowMode={windowMode}
-          />
-        )}
         {page === "memory" && <MemoryPage />}
         {page === "schedule" && <SchedulePage />}
         {page === "settings" && (
-          <SettingsPage onPersonaSaved={setPersona} onSettingsSaved={setSettings} persona={persona} settings={settings} />
+          <SettingsPage
+            onPersonaSaved={setPersona}
+            onSettingsSaved={setSettings}
+            persona={persona}
+            settings={settings}
+          />
         )}
       </div>
-    </main>
+      </main>
+    </div>
   );
 }

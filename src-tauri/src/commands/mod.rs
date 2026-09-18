@@ -6,10 +6,11 @@ use reqwest::{
     blocking::multipart::{Form, Part},
 };
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, PhysicalPosition, PhysicalSize, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::{
+    edge_tts,
     error::{AppError, CommandError},
     infrastructure::{
         credentials,
@@ -32,18 +33,70 @@ pub struct BootstrapResponse {
 
 #[tauri::command]
 pub fn bootstrap(database: State<'_, Database>) -> Result<BootstrapResponse, CommandError> {
-    let persona_exists = database.get_persona()?.is_some();
-    let chat_ready = database.get_api_profile("chat")?.is_some_and(|profile| {
-        profile.last_tested_at.is_some()
-            && credentials::secret_exists(&profile.secret_ref).unwrap_or(false)
-    });
     let window_mode = database.get_window_state()?.mode;
     Ok(BootstrapResponse {
         app_version: env!("CARGO_PKG_VERSION"),
-        onboarding_complete: persona_exists && chat_ready,
+        onboarding_complete: onboarding_complete(&database)?,
         database_ready: database.is_ready(),
         window_mode,
     })
+}
+
+pub fn onboarding_complete(database: &Database) -> Result<bool, AppError> {
+    Ok(!database.onboarding_required()?)
+}
+
+fn reveal_window(app: &AppHandle, label: &str) -> Result<(), CommandError> {
+    let window = app
+        .get_webview_window(label)
+        .ok_or_else(|| AppError::internal(format!("找不到 {label} 窗口")))?;
+    window
+        .show()
+        .and_then(|_| window.set_focus())
+        .map_err(|error| AppError::internal(format!("无法显示窗口：{error}")))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn open_chat_window(app: AppHandle, database: State<'_, Database>) -> Result<(), CommandError> {
+    if !onboarding_complete(&database)? {
+        return reveal_window(&app, "settings");
+    }
+    reveal_window(&app, "chat")
+}
+
+#[tauri::command]
+pub fn open_settings_window(app: AppHandle) -> Result<(), CommandError> {
+    reveal_window(&app, "settings")
+}
+
+#[tauri::command]
+pub async fn finish_onboarding(
+    app: AppHandle,
+    database: State<'_, Database>,
+) -> Result<(), CommandError> {
+    database.set_onboarding_required(false)?;
+    reveal_window(&app, "chat")?;
+    let settings = app
+        .get_webview_window("settings")
+        .ok_or_else(|| AppError::internal("找不到 settings 窗口"))?;
+    settings
+        .hide()
+        .map_err(|error| AppError::internal(format!("无法隐藏设置窗口：{error}")))?;
+    app.emit("nova:onboarding-complete", ())
+        .map_err(|error| AppError::internal(format!("无法同步完成状态：{error}")))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_conversation_data(
+    app: AppHandle,
+    database: State<'_, Database>,
+) -> Result<(), CommandError> {
+    database.clear_conversation_records()?;
+    app.emit("nova:conversation-cleared", ())
+        .map_err(|error| AppError::internal(format!("无法同步清除聊天记录：{error}")))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -58,7 +111,9 @@ pub fn save_persona(
 ) -> Result<PersonaProfile, CommandError> {
     persona.name = required_text("姓名", persona.name, 32)?;
     persona.personality = required_text("性格", persona.personality, 240)?;
-    persona.speech_style = required_text("说话方式", persona.speech_style, 240)?;
+    // Keep the legacy database column populated for backwards compatibility. The product now
+    // exposes one personality setting and lets it drive the companion's tone naturally.
+    persona.speech_style = persona.personality.clone();
     database.save_persona(&persona)?;
     Ok(persona)
 }
@@ -71,13 +126,23 @@ pub fn get_settings(database: State<'_, Database>) -> Result<AppSettings, Comman
 #[tauri::command]
 pub fn save_settings(
     database: State<'_, Database>,
-    settings: AppSettings,
+    mut settings: AppSettings,
 ) -> Result<AppSettings, CommandError> {
     let allowed_themes = ["rose", "lavender", "mint", "blue", "peach"];
     if !allowed_themes.contains(&settings.theme.as_str()) {
         return Err(AppError::Configuration("不支持的主题色".to_owned()).into());
     }
     validate_time_range(&settings.dnd_start, &settings.dnd_end)?;
+    let tts = edge_tts::validate_options(edge_tts::TtsOptions {
+        voice: settings.tts_voice.clone(),
+        rate: settings.tts_rate,
+        pitch: settings.tts_pitch,
+        volume: settings.tts_volume,
+    })?;
+    settings.tts_voice = tts.voice;
+    settings.tts_rate = tts.rate;
+    settings.tts_pitch = tts.pitch;
+    settings.tts_volume = tts.volume;
     database.save_settings(&settings)?;
     Ok(settings)
 }
@@ -150,6 +215,12 @@ pub fn save_api_profile(
     database: State<'_, Database>,
     mut profile: ApiProfileInput,
 ) -> Result<ApiProfileStatus, CommandError> {
+    if matches!(profile.capability, ApiCapability::Speech) {
+        return Err(AppError::Configuration(
+            "暂不支持自定义语音合成，请在 TTS 设置中配置 Edge TTS".to_owned(),
+        )
+        .into());
+    }
     profile.base_url = validate_base_url(profile.base_url)?;
     profile.path = required_text("接口路径", profile.path, 160)?;
     if !profile.path.starts_with('/') {
@@ -189,6 +260,12 @@ pub async fn test_api_profile(
     database: State<'_, Database>,
     capability: ApiCapability,
 ) -> Result<ApiTestResult, CommandError> {
+    if matches!(capability, ApiCapability::Speech) {
+        return Err(AppError::Configuration(
+            "暂不支持自定义语音合成，请在 TTS 设置中配置 Edge TTS".to_owned(),
+        )
+        .into());
+    }
     let profile = database
         .get_api_profile(capability.as_str())?
         .ok_or_else(|| AppError::Configuration("请先保存 API 配置".to_owned()))?;
@@ -496,10 +573,7 @@ async fn complete_chat(
             .ok_or_else(|| AppError::Configuration("请先完成角色设定".to_owned()))?;
         let mut messages = vec![RemoteChatMessage {
             role: "system".to_owned(),
-            content: format!(
-                "你是用户的长期 AI 陪伴者，名字是{}。你的性格是：{}。你的说话方式是：{}。请保持真诚、自然和有边界感，不要声称自己是真人。",
-                persona.name, persona.personality, persona.speech_style
-            ),
+            content: build_system_prompt(&persona),
         }];
         messages.extend(
             database
@@ -519,11 +593,7 @@ async fn complete_chat(
                     content: message.content,
                 }),
         );
-        let endpoint = format!(
-            "{}{}",
-            profile.base_url.trim_end_matches('/'),
-            profile.path
-        );
+        let endpoint = format!("{}{}", profile.base_url.trim_end_matches('/'), profile.path);
         let request = ChatCompletionRequest {
             model: profile.model,
             messages,
@@ -552,6 +622,23 @@ async fn complete_chat(
         database.update_chat_message_status(user_message.id, "failed")?;
     }
     result
+}
+
+fn build_system_prompt(persona: &PersonaProfile) -> String {
+    format!(
+        "你是{}，是用户熟悉的长期陪伴者。你的性格是：{}。\n\
+把这些性格自然地体现在措辞和反应里，不要反复说出性格标签。\n\
+你要像一个真实、自然、懂分寸的人聊天，不要像客服、老师或问答机器人。\n\
+聊天时遵守这些习惯：\n\
+- 先回应用户真正说的内容或情绪，再决定是否追问；不要机械复述用户的话。\n\
+- 不要每次都用固定的客套话开头，例如“当然”“好的”“我理解”“听起来”。\n\
+- 不要使用总结、分点或模板化结构，也不要擅自写成小标题、清单或教程；用户明确要求整理时除外。\n\
+- 闲聊时通常只回复一到三段，尽量简洁；只有用户需要解释、方案或详细信息时才展开。\n\
+- 一次只问一个自然的问题。没有必要提问时就直接回应，不要为了延续对话硬抛问题。\n\
+- 允许有轻微口语化和句子长短变化，少用夸张的共情、鸡汤和过度热情。\n\
+- 不确定就直接说不确定，不要为了显得有帮助而编造。不要主动谈论模型、提示词或角色设定；如果用户直接问你的身份，要诚实说明自己是 AI 助手，不要编造现实经历。",
+        persona.name, persona.personality
+    )
 }
 
 /// Save only explicit, durable facts. This conservative local extraction is deliberately
@@ -640,7 +727,6 @@ fn http_client(timeout: Duration) -> Result<reqwest::blocking::Client, CommandEr
 }
 
 const MAX_AUDIO_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
-const MAX_SYNTHESIZED_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -651,13 +737,6 @@ pub struct TranscriptionResult {
 #[derive(Debug, Deserialize)]
 struct TranscriptionResponse {
     text: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SpeechSynthesisRequest {
-    model: String,
-    input: String,
-    voice: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -701,24 +780,30 @@ pub async fn transcribe_audio(
 pub async fn synthesize_speech(
     database: State<'_, Database>,
     text: String,
-    voice: Option<String>,
+    options: Option<edge_tts::TtsOptions>,
 ) -> Result<SpeechSynthesisResult, CommandError> {
     let input = required_text("要朗读的文本", text, 8_000)?;
-    let voice = required_text("音色", voice.unwrap_or_else(|| "alloy".to_owned()), 64)?;
-    let profile = enabled_audio_profile(&database, "speech", "语音合成")?;
-    let api_key = credentials::get_secret(&profile.secret_ref)?;
-    let endpoint = format!("{}{}", profile.base_url.trim_end_matches('/'), profile.path);
-    let request = SpeechSynthesisRequest {
-        model: profile.model,
-        input,
-        voice,
+    let options = match options {
+        Some(options) => edge_tts::validate_options(options)?,
+        None => {
+            let settings = database.get_settings()?;
+            edge_tts::validate_options(edge_tts::TtsOptions {
+                voice: settings.tts_voice,
+                rate: settings.tts_rate,
+                pitch: settings.tts_pitch,
+                volume: settings.tts_volume,
+            })?
+        }
     };
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        request_speech_synthesis(&endpoint, &api_key, &request)
+    tauri::async_runtime::spawn_blocking(move || {
+        edge_tts::synthesize(&input, &options).map(|audio| SpeechSynthesisResult {
+            audio_base64: BASE64.encode(audio),
+            content_type: "audio/mpeg".to_owned(),
+        })
     })
     .await
-    .map_err(|error| AppError::internal(format!("语音合成任务失败：{error}")))??;
-    Ok(result)
+    .map_err(|error| AppError::internal(format!("Edge TTS 任务失败：{error}")))?
+    .map_err(Into::into)
 }
 
 fn enabled_audio_profile(
@@ -795,46 +880,6 @@ fn request_transcription(
     required_text("识别结果", response.text, 8_000)
 }
 
-fn request_speech_synthesis(
-    url: &str,
-    api_key: &str,
-    request: &SpeechSynthesisRequest,
-) -> Result<SpeechSynthesisResult, CommandError> {
-    let response = http_client(Duration::from_secs(90))?
-        .post(url)
-        .bearer_auth(api_key)
-        .json(request)
-        .send()
-        .map_err(|error| AppError::Network(format!("请求语音合成失败：{error}")))?;
-    validate_audio_api_response(response.status(), "语音合成")?;
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("audio/mpeg")
-        .split(';')
-        .next()
-        .unwrap_or("audio/mpeg")
-        .trim()
-        .to_ascii_lowercase();
-    if !content_type.starts_with("audio/") && content_type != "application/octet-stream" {
-        return Err(AppError::Audio("语音合成 API 没有返回音频数据".to_owned()).into());
-    }
-    let bytes = response
-        .bytes()
-        .map_err(|error| AppError::Network(format!("读取合成音频失败：{error}")))?;
-    if bytes.is_empty() {
-        return Err(AppError::Audio("语音合成 API 返回了空音频".to_owned()).into());
-    }
-    if bytes.len() > MAX_SYNTHESIZED_AUDIO_BYTES {
-        return Err(AppError::Audio("合成音频超过 25 MB，无法播放".to_owned()).into());
-    }
-    Ok(SpeechSynthesisResult {
-        audio_base64: BASE64.encode(bytes),
-        content_type,
-    })
-}
-
 fn validate_audio_api_response(status: StatusCode, capability: &str) -> Result<(), CommandError> {
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         return Err(AppError::Authorization("API Key 无效或没有访问权限".to_owned()).into());
@@ -857,8 +902,8 @@ pub enum WindowMode {
 impl WindowMode {
     fn dimensions(self) -> (&'static str, u32, u32, u32, u32) {
         match self {
-            Self::Compact => ("compact", 440, 760, 400, 560),
-            Self::Management => ("management", 1080, 760, 760, 560),
+            Self::Compact => ("compact", 440, 760, 400, 600),
+            Self::Management => ("management", 1080, 760, 920, 680),
         }
     }
 }
@@ -882,9 +927,9 @@ pub fn set_window_mode(
 
 pub fn restore_window_state(window: &WebviewWindow, state: &WindowState) -> Result<(), AppError> {
     let (minimum_width, minimum_height) = if state.mode == "compact" {
-        (400, 560)
+        (400, 600)
     } else {
-        (760, 560)
+        (920, 680)
     };
     window
         .set_min_size(Some(PhysicalSize::new(minimum_width, minimum_height)))
@@ -986,6 +1031,7 @@ mod tests {
     use crate::error::ErrorCategory;
 
     use super::BootstrapResponse;
+    use crate::infrastructure::database::PersonaProfile;
 
     fn mock_api(status: &str) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock API");
@@ -1045,6 +1091,20 @@ mod tests {
         assert!(!response.onboarding_complete);
         assert!(response.database_ready);
         assert_eq!(response.window_mode, "management");
+    }
+
+    #[test]
+    fn companion_prompt_requires_natural_conversation() {
+        let prompt = super::build_system_prompt(&PersonaProfile {
+            name: "小诺".to_owned(),
+            personality: "温柔、爱倾听".to_owned(),
+            speech_style: String::new(),
+        });
+
+        assert!(prompt.contains("不要像客服、老师或问答机器人"));
+        assert!(prompt.contains("不要每次都用固定的客套话开头"));
+        assert!(prompt.contains("不要使用总结、分点或模板化结构"));
+        assert!(prompt.contains("闲聊时通常只回复一到三段"));
     }
 
     #[test]
@@ -1116,24 +1176,6 @@ mod tests {
         .expect("transcription succeeds");
         server.join().expect("mock API exits");
         assert_eq!(text, "你好呀");
-    }
-
-    #[test]
-    fn speech_synthesis_returns_base64_audio_with_a_safe_content_type() {
-        let (url, server) = mock_audio_api("200 OK", "audio/mpeg; charset=binary", &[1, 2, 3]);
-        let result = super::request_speech_synthesis(
-            &url,
-            "test-secret",
-            &super::SpeechSynthesisRequest {
-                model: "speech-model".to_owned(),
-                input: "你好".to_owned(),
-                voice: "alloy".to_owned(),
-            },
-        )
-        .expect("speech synthesis succeeds");
-        server.join().expect("mock API exits");
-        assert_eq!(result.content_type, "audio/mpeg");
-        assert_eq!(result.audio_base64, "AQID");
     }
 
     #[test]

@@ -16,6 +16,7 @@ const DATABASE_FILE_NAME: &str = "nova.db";
 pub struct PersonaProfile {
     pub name: String,
     pub personality: String,
+    #[serde(default, skip_serializing)]
     pub speech_style: String,
 }
 
@@ -28,6 +29,10 @@ pub struct AppSettings {
     pub dnd_end: Option<String>,
     pub voice_autoplay: bool,
     pub proactive_enabled: bool,
+    pub tts_voice: String,
+    pub tts_rate: i32,
+    pub tts_pitch: i32,
+    pub tts_volume: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +125,30 @@ impl Database {
         self.connection.lock().is_ok() && self.path.exists()
     }
 
+    pub fn onboarding_required(&self) -> Result<bool, AppError> {
+        self.connection()?
+            .query_row(
+                "SELECT onboarding_required FROM app_settings WHERE id = 1",
+                [],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to read onboarding state: {error}"))
+            })
+    }
+
+    pub fn set_onboarding_required(&self, required: bool) -> Result<(), AppError> {
+        self.connection()?
+            .execute(
+                "UPDATE app_settings SET onboarding_required = ?1 WHERE id = 1",
+                [i64::from(required)],
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to save onboarding state: {error}"))
+            })?;
+        Ok(())
+    }
+
     pub fn get_persona(&self) -> Result<Option<PersonaProfile>, AppError> {
         self.connection()?
             .query_row(
@@ -156,7 +185,8 @@ impl Database {
     pub fn get_settings(&self) -> Result<AppSettings, AppError> {
         self.connection()?
             .query_row(
-                "SELECT theme, dark_mode, dnd_start, dnd_end, voice_autoplay, proactive_enabled
+                "SELECT theme, dark_mode, dnd_start, dnd_end, voice_autoplay, proactive_enabled,
+                        tts_voice, tts_rate, tts_pitch, tts_volume
                  FROM app_settings WHERE id = 1",
                 [],
                 |row| {
@@ -167,6 +197,10 @@ impl Database {
                         dnd_end: row.get(3)?,
                         voice_autoplay: row.get::<_, i64>(4)? != 0,
                         proactive_enabled: row.get::<_, i64>(5)? != 0,
+                        tts_voice: row.get(6)?,
+                        tts_rate: row.get(7)?,
+                        tts_pitch: row.get(8)?,
+                        tts_volume: row.get(9)?,
                     })
                 },
             )
@@ -182,7 +216,11 @@ impl Database {
                     dnd_start = ?3,
                     dnd_end = ?4,
                     voice_autoplay = ?5,
-                    proactive_enabled = ?6
+                    proactive_enabled = ?6,
+                    tts_voice = ?7,
+                    tts_rate = ?8,
+                    tts_pitch = ?9,
+                    tts_volume = ?10
                  WHERE id = 1",
                 params![
                     settings.theme,
@@ -191,6 +229,10 @@ impl Database {
                     settings.dnd_end,
                     settings.voice_autoplay,
                     settings.proactive_enabled,
+                    settings.tts_voice,
+                    settings.tts_rate,
+                    settings.tts_pitch,
+                    settings.tts_volume,
                 ],
             )
             .map_err(|error| AppError::database(format!("failed to save settings: {error}")))?;
@@ -268,6 +310,20 @@ impl Database {
             )
             .optional()
             .map_err(|error| AppError::database(format!("failed to read API profile: {error}")))
+    }
+
+    pub fn list_api_secret_refs(&self) -> Result<Vec<String>, AppError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT secret_ref FROM api_profiles")
+            .map_err(|error| {
+                AppError::database(format!("failed to prepare API secret query: {error}"))
+            })?;
+        statement
+            .query_map([], |row| row.get(0))
+            .map_err(|error| AppError::database(format!("failed to read API secrets: {error}")))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|error| AppError::database(format!("failed to decode API secrets: {error}")))
     }
 
     pub fn save_api_profile(&self, profile: &ApiProfileRecord) -> Result<(), AppError> {
@@ -548,6 +604,32 @@ impl Database {
             .map_err(|error| AppError::database(format!("failed to delete schedule: {error}")))
     }
 
+    pub fn clear_conversation_records(&self) -> Result<(), AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction().map_err(|error| {
+            AppError::database(format!(
+                "failed to start clearing conversation data: {error}"
+            ))
+        })?;
+        transaction
+            .execute_batch(
+                "DELETE FROM proactive_events;
+                 DELETE FROM memories;
+                 DELETE FROM chat_messages;
+                 DELETE FROM sqlite_sequence
+                 WHERE name IN ('proactive_events', 'memories', 'chat_messages');",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to clear conversation data: {error}"))
+            })?;
+        transaction.commit().map_err(|error| {
+            AppError::database(format!(
+                "failed to commit clearing conversation data: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, AppError> {
         self.connection
             .lock()
@@ -751,6 +833,44 @@ fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         })?;
     }
 
+    if current_version < 5 {
+        let transaction = connection.transaction().map_err(|error| {
+            AppError::database(format!("failed to start database migration 5: {error}"))
+        })?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE app_settings ADD COLUMN tts_voice TEXT NOT NULL DEFAULT 'zh-CN-XiaoxiaoNeural';
+                 ALTER TABLE app_settings ADD COLUMN tts_rate INTEGER NOT NULL DEFAULT -5;
+                 ALTER TABLE app_settings ADD COLUMN tts_pitch INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE app_settings ADD COLUMN tts_volume INTEGER NOT NULL DEFAULT 0;
+                 INSERT INTO schema_migrations (version) VALUES (5);",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 5: {error}"))
+            })?;
+        transaction.commit().map_err(|error| {
+            AppError::database(format!("failed to commit database migration 5: {error}"))
+        })?;
+    }
+
+    if current_version < 6 {
+        let transaction = connection.transaction().map_err(|error| {
+            AppError::database(format!("failed to start database migration 6: {error}"))
+        })?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE app_settings ADD COLUMN onboarding_required INTEGER NOT NULL DEFAULT 0
+                    CHECK (onboarding_required IN (0, 1));
+                 INSERT INTO schema_migrations (version) VALUES (6);",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 6: {error}"))
+            })?;
+        transaction.commit().map_err(|error| {
+            AppError::database(format!("failed to commit database migration 6: {error}"))
+        })?;
+    }
+
     Ok(())
 }
 
@@ -814,8 +934,98 @@ mod tests {
             dnd_end: Some("08:00".to_owned()),
             voice_autoplay: false,
             proactive_enabled: false,
+            tts_voice: "zh-CN-XiaoxiaoNeural".to_owned(),
+            tts_rate: -5,
+            tts_pitch: 0,
+            tts_volume: 0,
         };
         database.save_settings(&settings).expect("save settings");
+        assert_eq!(database.get_settings().expect("read settings"), settings);
+    }
+
+    #[test]
+    fn clears_only_memories_and_conversation_records() {
+        let directory = tempdir().expect("temporary directory");
+        let database = Database::initialize(directory.path()).expect("database should initialize");
+        database
+            .save_persona(&PersonaProfile {
+                name: "小诺".to_owned(),
+                personality: "温柔".to_owned(),
+                speech_style: "温柔".to_owned(),
+            })
+            .expect("save persona");
+        database
+            .save_api_profile(&ApiProfileRecord {
+                capability: "chat".to_owned(),
+                base_url: "https://api.example.com/v1".to_owned(),
+                path: "/chat/completions".to_owned(),
+                model: "gpt-4.1-mini".to_owned(),
+                secret_ref: "api-chat".to_owned(),
+                enabled: true,
+                last_tested_at: None,
+            })
+            .expect("save API profile");
+        let settings = AppSettings {
+            theme: "mint".to_owned(),
+            dark_mode: true,
+            dnd_start: Some("22:00".to_owned()),
+            dnd_end: Some("07:00".to_owned()),
+            voice_autoplay: false,
+            proactive_enabled: false,
+            tts_voice: "zh-CN-XiaoxiaoNeural".to_owned(),
+            tts_rate: -5,
+            tts_pitch: 0,
+            tts_volume: 0,
+        };
+        database.save_settings(&settings).expect("save settings");
+        let source = database
+            .insert_chat_message("user", "记住我喜欢散步", "sent")
+            .expect("save source message");
+        database
+            .insert_memory("我喜欢散步", source.id)
+            .expect("save memory");
+        database
+            .insert_schedule(
+                "散步",
+                "2026-09-18T18:00",
+                "2026-09-18T17:50",
+                Some(source.id),
+                "scheduled",
+            )
+            .expect("save schedule");
+
+        database
+            .clear_conversation_records()
+            .expect("clear conversation records");
+
+        assert!(
+            !database
+                .onboarding_required()
+                .expect("read unchanged onboarding state")
+        );
+        assert!(database.get_persona().expect("read persona").is_some());
+        assert_eq!(
+            database.get_api_profile("chat").expect("read API profile"),
+            Some(ApiProfileRecord {
+                capability: "chat".to_owned(),
+                base_url: "https://api.example.com/v1".to_owned(),
+                path: "/chat/completions".to_owned(),
+                model: "gpt-4.1-mini".to_owned(),
+                secret_ref: "api-chat".to_owned(),
+                enabled: true,
+                last_tested_at: None,
+            })
+        );
+        assert!(
+            database
+                .list_chat_messages()
+                .expect("list messages")
+                .is_empty()
+        );
+        assert!(database.list_memories().expect("list memories").is_empty());
+        let schedules = database.list_schedules().expect("list schedules");
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].source_message_id, None);
         assert_eq!(database.get_settings().expect("read settings"), settings);
     }
 
