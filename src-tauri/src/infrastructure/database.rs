@@ -630,6 +630,130 @@ impl Database {
         Ok(())
     }
 
+    /// Lists every reminder occurrence already handed to the notification layer.
+    pub fn list_reminder_dispatches(&self) -> Result<Vec<(i64, String)>, AppError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT schedule_id, remind_at FROM reminder_dispatches
+                 ORDER BY schedule_id ASC, remind_at ASC",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to prepare reminder dispatch query: {error}"))
+            })?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| {
+                AppError::database(format!("failed to read reminder dispatches: {error}"))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                AppError::database(format!("failed to decode reminder dispatches: {error}"))
+            })
+    }
+
+    /// Records a reminder occurrence that was handed off to the notification layer.
+    /// Re-inserting the same occurrence is ignored so repeated scheduler ticks stay idempotent.
+    pub fn insert_reminder_dispatch(
+        &self,
+        schedule_id: i64,
+        remind_at: &str,
+    ) -> Result<(), AppError> {
+        self.connection()?
+            .execute(
+                "INSERT OR IGNORE INTO reminder_dispatches (schedule_id, remind_at)
+                 VALUES (?1, ?2)",
+                params![schedule_id, remind_at],
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to save reminder dispatch: {error}"))
+            })?;
+        Ok(())
+    }
+
+    /// Persists a proactive message and records its dispatch instant as Unix seconds.
+    ///
+    /// The caller shows the OS notification only after this succeeds, so the dispatch log is
+    /// the idempotency source of truth even if the notification itself fails.
+    pub fn insert_proactive_event(
+        &self,
+        message_id: i64,
+        idle_started_at: &str,
+    ) -> Result<(), AppError> {
+        self.connection()?
+            .execute(
+                "INSERT INTO proactive_events (message_id, idle_started_at, notified_at)
+                 VALUES (?1, ?2, CAST(strftime('%s','now') AS TEXT))",
+                params![message_id, idle_started_at],
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to save proactive event: {error}"))
+            })?;
+        Ok(())
+    }
+
+    /// Returns `(idle_started_at, notified_at)` for every proactive message already dispatched.
+    pub fn list_proactive_dispatches(&self) -> Result<Vec<(String, String)>, AppError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT idle_started_at, notified_at FROM proactive_events
+                 WHERE notified_at IS NOT NULL ORDER BY id ASC",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to prepare proactive dispatch query: {error}"))
+            })?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| {
+                AppError::database(format!("failed to read proactive dispatches: {error}"))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                AppError::database(format!("failed to decode proactive dispatches: {error}"))
+            })
+    }
+
+    /// Returns the most recent proactive message the user has not opened yet, if any.
+    pub fn latest_unopened_proactive_message(&self) -> Result<Option<ChatMessage>, AppError> {
+        self.connection()?
+            .query_row(
+                "SELECT messages.id, messages.role, messages.content, messages.created_at,
+                        messages.status
+                 FROM proactive_events AS events
+                 JOIN chat_messages AS messages ON messages.id = events.message_id
+                 WHERE events.opened_at IS NULL AND events.notified_at IS NOT NULL
+                 ORDER BY messages.id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(ChatMessage {
+                        id: row.get(0)?,
+                        role: row.get(1)?,
+                        content: row.get(2)?,
+                        created_at: row.get(3)?,
+                        status: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                AppError::database(format!("failed to read proactive message: {error}"))
+            })
+    }
+
+    /// Marks a proactive message as opened so it is no longer surfaced as pending.
+    pub fn mark_proactive_opened(&self, message_id: i64) -> Result<(), AppError> {
+        self.connection()?
+            .execute(
+                "UPDATE proactive_events SET opened_at = CURRENT_TIMESTAMP WHERE message_id = ?1",
+                [message_id],
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to mark proactive message opened: {error}"))
+            })?;
+        Ok(())
+    }
+
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, AppError> {
         self.connection
             .lock()
@@ -868,6 +992,28 @@ fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             })?;
         transaction.commit().map_err(|error| {
             AppError::database(format!("failed to commit database migration 6: {error}"))
+        })?;
+    }
+
+    if current_version < 7 {
+        let transaction = connection.transaction().map_err(|error| {
+            AppError::database(format!("failed to start database migration 7: {error}"))
+        })?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS reminder_dispatches (
+                    schedule_id INTEGER NOT NULL,
+                    remind_at TEXT NOT NULL,
+                    dispatched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (schedule_id, remind_at)
+                 );
+                 INSERT INTO schema_migrations (version) VALUES (7);",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 7: {error}"))
+            })?;
+        transaction.commit().map_err(|error| {
+            AppError::database(format!("failed to commit database migration 7: {error}"))
         })?;
     }
 
@@ -1243,6 +1389,94 @@ mod tests {
                 .expect("schedule remains")
                 .source_message_id,
             None
+        );
+    }
+
+    #[test]
+    fn records_reminder_dispatches_idempotently() {
+        let directory = tempdir().expect("temporary directory");
+        let database = Database::initialize(directory.path()).expect("database should initialize");
+
+        database
+            .insert_reminder_dispatch(7, "2026-09-18T09:00:00+08:00")
+            .expect("save reminder dispatch");
+        database
+            .insert_reminder_dispatch(7, "2026-09-18T09:00:00+08:00")
+            .expect("repeating the same occurrence is ignored");
+        database
+            .insert_reminder_dispatch(7, "2026-09-18T09:30:00+08:00")
+            .expect("save moved reminder dispatch");
+
+        assert_eq!(
+            database
+                .list_reminder_dispatches()
+                .expect("list reminder dispatches"),
+            vec![
+                (7, "2026-09-18T09:00:00+08:00".to_owned()),
+                (7, "2026-09-18T09:30:00+08:00".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tracks_proactive_messages_until_they_are_opened() {
+        let directory = tempdir().expect("temporary directory");
+        let database = Database::initialize(directory.path()).expect("database should initialize");
+        let message = database
+            .insert_chat_message("assistant", "好久没聊啦，最近还好吗？", "sent")
+            .expect("save proactive message");
+
+        database
+            .insert_proactive_event(message.id, "1800000000")
+            .expect("save proactive event");
+
+        let dispatches = database
+            .list_proactive_dispatches()
+            .expect("list proactive dispatches");
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].0, "1800000000");
+        assert!(!dispatches[0].1.is_empty());
+
+        assert_eq!(
+            database
+                .latest_unopened_proactive_message()
+                .expect("read pending proactive message"),
+            Some(message.clone())
+        );
+
+        let newer = database
+            .insert_chat_message("assistant", "更晚的一条问候", "sent")
+            .expect("save newer proactive message");
+        database
+            .insert_proactive_event(newer.id, "1800003600")
+            .expect("save newer proactive event");
+        assert_eq!(
+            database
+                .latest_unopened_proactive_message()
+                .expect("read latest proactive message")
+                .map(|message| message.id),
+            Some(newer.id)
+        );
+
+        database
+            .mark_proactive_opened(message.id)
+            .expect("mark proactive message opened");
+        assert_eq!(
+            database
+                .latest_unopened_proactive_message()
+                .expect("read pending proactive message")
+                .map(|message| message.id),
+            Some(newer.id)
+        );
+
+        database
+            .mark_proactive_opened(newer.id)
+            .expect("mark newer proactive message opened");
+        assert!(
+            database
+                .latest_unopened_proactive_message()
+                .expect("read after opening both")
+                .is_none()
         );
     }
 }

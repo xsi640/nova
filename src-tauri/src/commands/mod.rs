@@ -19,6 +19,7 @@ use crate::{
             ScheduleRecord, WindowState,
         },
     },
+    proactive,
     schedule_intent::{LocalDate, parse_schedule_intent},
 };
 
@@ -459,6 +460,44 @@ pub fn delete_schedule(database: State<'_, Database>, id: i64) -> Result<bool, C
     Ok(database.delete_schedule(id)?)
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReminderDispatch {
+    pub schedule_id: i64,
+    pub remind_at: String,
+}
+
+/// Lists every reminder occurrence the scheduler has already handed to the OS.
+#[tauri::command]
+pub fn list_reminder_dispatches(
+    database: State<'_, Database>,
+) -> Result<Vec<ReminderDispatch>, CommandError> {
+    Ok(database
+        .list_reminder_dispatches()?
+        .into_iter()
+        .map(|(schedule_id, remind_at)| ReminderDispatch {
+            schedule_id,
+            remind_at,
+        })
+        .collect())
+}
+
+/// Records a reminder occurrence after its OS notification was handed off successfully.
+/// Repeated calls for the same occurrence are idempotent.
+#[tauri::command]
+pub fn mark_reminder_dispatched(
+    database: State<'_, Database>,
+    schedule_id: i64,
+    remind_at: String,
+) -> Result<(), CommandError> {
+    if schedule_id <= 0 {
+        return Err(AppError::Configuration("日程标识无效".to_owned()).into());
+    }
+    let remind_at = required_text("提醒时间", remind_at, 64)?;
+    database.insert_reminder_dispatch(schedule_id, &remind_at)?;
+    Ok(())
+}
+
 /// Returns the privacy-preserving JSON export for the UI to save to a user-selected file.
 /// The export module uses an explicit allow-list and never reads credentials or API settings.
 #[tauri::command]
@@ -479,6 +518,209 @@ pub fn show_notification(app: AppHandle, title: String, body: String) -> Result<
         .show()
         .map_err(|error| AppError::PlatformPermission(format!("无法显示系统通知：{error}")))?;
     Ok(())
+}
+
+/// Upper bound for how far back a reported idle-session anchor may be: thirty days. A clock
+/// glitch or corrupt local value beyond this is rejected so the session cannot move arbitrarily.
+const MAX_PROACTIVE_IDLE_SECONDS: i64 = 2_592_000;
+const PROACTIVE_NOTIFICATION_TITLE: &str = "Nova";
+const PROACTIVE_NOTIFICATION_MAX_CHARS: usize = 120;
+
+/// Runs one proactive scheduler tick. It stays silent unless an idle check-in is eligible
+/// and a natural message could be generated; failures are never surfaced to the UI.
+#[tauri::command]
+pub async fn check_in_if_idle(
+    app: AppHandle,
+    database: State<'_, Database>,
+    idle_started_at: i64,
+    local_minute_of_day: u16,
+) -> Result<Option<ChatMessage>, CommandError> {
+    let settings = database.get_settings()?;
+    if !settings.proactive_enabled {
+        return Ok(None);
+    }
+
+    let now = unix_timestamp();
+    // The frontend supplies a stable idle-session anchor (the last activity instant). Reject a
+    // future or implausibly old value so the event key stays deterministic across ticks.
+    if idle_started_at > now || now.saturating_sub(idle_started_at) > MAX_PROACTIVE_IDLE_SECONDS {
+        return Ok(None);
+    }
+    let policy = proactive::ProactivePolicy {
+        enabled: true,
+        minimum_idle_seconds: proactive::DEFAULT_MIN_IDLE_SECONDS,
+        cooldown_seconds: proactive::DEFAULT_COOLDOWN_SECONDS,
+        quiet_hours: parse_quiet_hours(&settings.dnd_start, &settings.dnd_end),
+    };
+    let context = proactive::ProactiveContext {
+        now,
+        idle_started_at,
+        local_minute_of_day,
+    };
+    if proactive::next_suggestion(policy, context, proactive_dispatch_history(&database)?).is_none()
+    {
+        return Ok(None);
+    }
+
+    let idle_started_at_text = idle_started_at.to_string();
+    let Some(message) = generate_proactive_message(&database, &idle_started_at_text).await? else {
+        return Ok(None);
+    };
+    if let Err(error) = show_proactive_notification(&app, &message.content) {
+        eprintln!("failed to show proactive notification: {}", error.message);
+    }
+    Ok(Some(message))
+}
+
+/// Returns the most recent proactive message the user has not opened yet, if any.
+#[tauri::command]
+pub fn pending_proactive_message(
+    database: State<'_, Database>,
+) -> Result<Option<ChatMessage>, CommandError> {
+    Ok(database.latest_unopened_proactive_message()?)
+}
+
+/// Marks a proactive message as opened once it has been shown in the conversation.
+#[tauri::command]
+pub fn mark_proactive_opened(
+    database: State<'_, Database>,
+    message_id: i64,
+) -> Result<(), CommandError> {
+    database.mark_proactive_opened(message_id)?;
+    Ok(())
+}
+
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+/// Parses the stored quiet-hours pair. A missing or malformed pair simply disables quiet hours.
+fn parse_quiet_hours(
+    start: &Option<String>,
+    end: &Option<String>,
+) -> Option<proactive::QuietHours> {
+    let start = parse_minute_of_day(start.as_deref()?)?;
+    let end = parse_minute_of_day(end.as_deref()?)?;
+    proactive::QuietHours::new(start, end)
+}
+
+fn parse_minute_of_day(value: &str) -> Option<u16> {
+    let (hour, minute) = value.trim().split_once(':')?;
+    if hour.len() != 2 || minute.len() != 2 {
+        return None;
+    }
+    let hour = hour.parse::<u16>().ok()?;
+    let minute = minute.parse::<u16>().ok()?;
+    (hour < 24 && minute < 60).then_some(hour * 60 + minute)
+}
+
+/// Rebuilds dispatch history from persisted proactive events.
+///
+/// `idle_started_at` is stored as exact Unix seconds so the deterministic policy can key on it.
+/// `notified_at` is written as Unix seconds by the only writer; if it is ever non-numeric the
+/// idle session start is used as a last-resort instant so history parsing never fails.
+fn proactive_dispatch_history(
+    database: &Database,
+) -> Result<Vec<proactive::ProactiveDispatchRecord>, CommandError> {
+    Ok(database
+        .list_proactive_dispatches()?
+        .into_iter()
+        .filter_map(|(idle_started_at, notified_at)| {
+            let idle_started_at = idle_started_at.parse::<i64>().ok()?;
+            let dispatched_at = notified_at.parse::<i64>().ok().unwrap_or(idle_started_at);
+            Some(proactive::ProactiveDispatchRecord {
+                key: proactive::ProactiveEventKey {
+                    kind: proactive::ProactiveTriggerKind::IdleCheckIn,
+                    idle_started_at,
+                },
+                dispatched_at,
+            })
+        })
+        .collect())
+}
+
+/// Generates and persists one proactive check-in. Returns `None` for any recoverable
+/// configuration or network problem so the background tick stays silent.
+async fn generate_proactive_message(
+    database: &Database,
+    idle_started_at: &str,
+) -> Result<Option<ChatMessage>, CommandError> {
+    let Some(profile) = database
+        .get_api_profile("chat")?
+        .filter(|profile| profile.enabled)
+    else {
+        return Ok(None);
+    };
+    let Some(persona) = database.get_persona()? else {
+        return Ok(None);
+    };
+    let Ok(api_key) = credentials::get_secret(&profile.secret_ref) else {
+        return Ok(None);
+    };
+
+    let mut messages = vec![RemoteChatMessage {
+        role: "system".to_owned(),
+        content: proactive_check_in_prompt(&persona),
+    }];
+    messages.extend(
+        database
+            .list_chat_messages()?
+            .into_iter()
+            .filter(|message| {
+                message.status == "sent" && matches!(message.role.as_str(), "user" | "assistant")
+            })
+            .rev()
+            .take(6)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|message| RemoteChatMessage {
+                role: message.role,
+                content: message.content,
+            }),
+    );
+    let endpoint = format!("{}{}", profile.base_url.trim_end_matches('/'), profile.path);
+    let request = ChatCompletionRequest {
+        model: profile.model,
+        messages,
+    };
+    let reply = match tauri::async_runtime::spawn_blocking(move || {
+        request_chat_completion(&endpoint, &api_key, &request)
+    })
+    .await
+    {
+        Ok(Ok(reply)) => reply,
+        _ => return Ok(None),
+    };
+
+    let message = database.insert_chat_message("assistant", &reply, "sent")?;
+    database.insert_proactive_event(message.id, idle_started_at)?;
+    Ok(Some(message))
+}
+
+fn proactive_check_in_prompt(persona: &PersonaProfile) -> String {
+    format!(
+        "{}\n\n用户已经有一段时间没有主动说话了。请以{}的语气，像朋友偶尔想起对方一样，自然地开始一次轻轻的问候。\n要求：\n- 只说一到两句简短的话。\n- 不要提到你在监测、计时、空闲状态或任何通知。\n- 不要追问用户为什么没有回应。\n- 不要使用总结、分点或模板化结构。",
+        build_system_prompt(persona),
+        persona.name
+    )
+}
+
+fn show_proactive_notification(app: &AppHandle, body: &str) -> Result<(), CommandError> {
+    app.notification()
+        .builder()
+        .title(PROACTIVE_NOTIFICATION_TITLE)
+        .body(truncate_chars(body, PROACTIVE_NOTIFICATION_MAX_CHARS))
+        .show()
+        .map_err(|error| AppError::PlatformPermission(format!("无法显示系统通知：{error}")))?;
+    Ok(())
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1220,5 +1462,52 @@ mod tests {
             Some("我叫小苏，今天有点累".to_owned())
         );
         assert_eq!(super::extract_memory_candidate("今天下雨了"), None);
+    }
+
+    #[test]
+    fn parses_quiet_hours_from_settings() {
+        assert!(super::parse_quiet_hours(&None, &Some("08:00".to_owned())).is_none());
+        assert!(
+            super::parse_quiet_hours(&Some("25:00".to_owned()), &Some("08:00".to_owned()))
+                .is_none()
+        );
+        let quiet_hours =
+            super::parse_quiet_hours(&Some("23:00".to_owned()), &Some("08:00".to_owned()))
+                .expect("valid quiet hours");
+        assert!(quiet_hours.contains(23 * 60));
+        assert!(!quiet_hours.contains(12 * 60));
+    }
+
+    #[test]
+    fn truncates_notification_bodies_to_a_bounded_length() {
+        let body = "好".repeat(200);
+        assert_eq!(super::truncate_chars(&body, 120).chars().count(), 120);
+        assert_eq!(super::truncate_chars("简短", 120), "简短");
+    }
+
+    #[test]
+    fn rebuilds_proactive_dispatch_history_from_persisted_events() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = crate::infrastructure::database::Database::initialize(directory.path())
+            .expect("database should initialize");
+        let message = database
+            .insert_chat_message("assistant", "在忙吗？", "sent")
+            .expect("save proactive message");
+        database
+            .insert_proactive_event(message.id, "1800000000")
+            .expect("save proactive event");
+
+        let history = super::proactive_dispatch_history(&database).expect("dispatch history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].key.kind,
+            crate::proactive::ProactiveTriggerKind::IdleCheckIn
+        );
+        assert_eq!(history[0].key.idle_started_at, 1_800_000_000);
+        // `notified_at` is persisted as Unix seconds, so the dispatch instant parses exactly
+        // instead of falling back to the idle-session start (which would weaken the cooldown).
+        let now = super::unix_timestamp();
+        assert!(history[0].dispatched_at <= now);
+        assert!(history[0].dispatched_at >= now - 5);
     }
 }

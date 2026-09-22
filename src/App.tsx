@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   bootstrap,
+  checkInIfIdle,
   getApiProfileStatus,
   getPersona,
   getSettings,
@@ -17,8 +18,12 @@ import {
   getScheduleCandidate,
   listMemories,
   listMessages,
+  listReminderDispatches,
   listSchedules,
+  markProactiveOpened,
+  markReminderDispatched,
   openSettingsWindow,
+  pendingProactiveMessage,
   retryMessage,
   saveApiProfile,
   savePersona,
@@ -42,11 +47,16 @@ import {
   type ScheduleRecord,
   type ScheduleCandidate,
   type ScheduleStatus,
+  type SpeechSynthesisResult,
   updateMemory,
   updateSchedule,
 } from "./lib/commands";
 
 type Page = "memory" | "schedule" | "settings";
+
+// The chat page owns the message list; App-level companion effects hand messages to it
+// through this value.
+type ProactiveDelivery = { message: ChatMessage; focus: boolean };
 
 const navigation: Array<{ id: Page; label: string; glyph: string }> = [
   { id: "memory", label: "记忆", glyph: "◇" },
@@ -196,6 +206,82 @@ function errorMessage(error: unknown): string {
     return String(error.message);
   }
   return "保存失败，请稍后重试";
+}
+
+const SPEECH_SENTENCE_ENDERS = "。！？!?；;\n";
+const SPEECH_MIN_SEGMENT_LENGTH = 40;
+const SPEECH_MAX_SEGMENT_LENGTH = 180;
+const SPEECH_MAX_SEGMENTS = 20;
+
+function splitSpeechSegments(text: string): string[] {
+  const fragments: string[] = [];
+  let current = "";
+  for (const char of text.trim()) {
+    current += char;
+    if (SPEECH_SENTENCE_ENDERS.includes(char)) {
+      fragments.push(current);
+      current = "";
+    }
+  }
+  if (current) fragments.push(current);
+
+  // Fragments below the minimum length are carried forward into the next sentence so each
+  // synthesis request is worth the round trip. Raw fragments are kept so spacing between
+  // merged sentences survives; every segment is trimmed once at the end.
+  const merged: string[] = [];
+  let pending = "";
+  for (const fragment of fragments) {
+    if (!fragment.trim()) continue;
+    pending += fragment;
+    if (pending.length >= SPEECH_MIN_SEGMENT_LENGTH) {
+      merged.push(pending);
+      pending = "";
+    }
+  }
+  if (pending) {
+    const last = merged.at(-1);
+    if (last === undefined) merged.push(pending);
+    else merged[merged.length - 1] = last + pending;
+  }
+
+  const segments = merged.flatMap((piece) => piece.length > SPEECH_MAX_SEGMENT_LENGTH ? splitLongSpeechSegment(piece) : [piece]);
+  const trimmed = segments.map((segment) => segment.trim()).filter(Boolean);
+  if (trimmed.length <= SPEECH_MAX_SEGMENTS) return trimmed;
+  // Re-split the overflow into bounded pieces instead of folding it into one segment, which
+  // could exceed the backend's per-request character limit.
+  return [...trimmed.slice(0, SPEECH_MAX_SEGMENTS - 1), ...splitLongSpeechSegment(trimmed.slice(SPEECH_MAX_SEGMENTS - 1).join(""))];
+}
+
+function splitLongSpeechSegment(segment: string): string[] {
+  const parts: string[] = [];
+  let rest = segment;
+  while (rest.length > SPEECH_MAX_SEGMENT_LENGTH) {
+    const window = rest.slice(0, SPEECH_MAX_SEGMENT_LENGTH);
+    const cut = Math.max(
+      window.lastIndexOf("，"),
+      window.lastIndexOf(","),
+      window.lastIndexOf("、"),
+      window.lastIndexOf(" "),
+      window.lastIndexOf("\n"),
+    );
+    let end = cut > 0 ? cut + 1 : SPEECH_MAX_SEGMENT_LENGTH;
+    // Never cut a surrogate pair in half; a lone surrogate is not valid JSON text downstream.
+    if (end < rest.length) {
+      const before = rest.charCodeAt(end - 1);
+      const after = rest.charCodeAt(end);
+      if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) end -= 1;
+    }
+    if (end <= 0) end = SPEECH_MAX_SEGMENT_LENGTH;
+    parts.push(rest.slice(0, end));
+    rest = rest.slice(end);
+  }
+  if (rest) parts.push(rest);
+  return parts;
+}
+
+/** Pending sends use negative temporary ids; they must sort after persisted messages. */
+function messageOrderKey(id: number): number {
+  return id < 0 ? Number.MAX_SAFE_INTEGER : id;
 }
 
 function MarkdownMessage({ content }: { content: string }) {
@@ -477,11 +563,13 @@ function ChatPage({
   persona,
   onOpenSettings,
   settings,
+  proactiveDelivery,
 }: {
   status: BootstrapResponse | null;
   persona: PersonaProfile | null;
   onOpenSettings: () => void;
   settings: AppSettings;
+  proactiveDelivery: ProactiveDelivery | null;
 }) {
   const name = persona?.name ?? "Nova";
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -493,6 +581,7 @@ function ChatPage({
   const [transcribing, setTranscribing] = useState(false);
   const [transcriptDraft, setTranscriptDraft] = useState<string | null>(null);
   const [speakingMessageId, setSpeakingMessageId] = useState<number | null>(null);
+  const [focusMessageId, setFocusMessageId] = useState<number | null>(null);
   const [scheduleCandidate, setScheduleCandidate] = useState<ScheduleCandidate | null>(null);
   const [confirmingSchedule, setConfirmingSchedule] = useState(false);
   const conversationRef = useRef<HTMLDivElement>(null);
@@ -501,7 +590,8 @@ function ChatPage({
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const speechCacheRef = useRef(new Map<number, { audioBase64: string; contentType: string }>());
+  const playTokenRef = useRef(0);
+  const speechCacheRef = useRef(new Map<number, SpeechSynthesisResult[]>());
 
   useEffect(() => {
     let active = true;
@@ -523,10 +613,29 @@ function ChatPage({
   }, [messages, sending]);
 
   useEffect(() => () => {
+    // Invalidate any in-flight playback before pausing so its loop cannot stay pending forever.
+    playTokenRef.current += 1;
     recorderRef.current?.stop();
     recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
     audioRef.current?.pause();
   }, []);
+
+  useEffect(() => {
+    if (!proactiveDelivery) return;
+    const { message, focus } = proactiveDelivery;
+    setMessages((current) => current.some((item) => item.id === message.id)
+      ? current
+      : [...current, message].sort((left, right) => messageOrderKey(left.id) - messageOrderKey(right.id)));
+    if (focus) setFocusMessageId(message.id);
+  }, [proactiveDelivery]);
+
+  useEffect(() => {
+    if (focusMessageId === null) return;
+    const target = document.getElementById(`message-${focusMessageId}`);
+    if (!target) return;
+    setFocusMessageId(null);
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [focusMessageId, messages]);
 
   function mergeExchange(exchange: ChatExchange, temporaryId?: number) {
     setMessages((current) => [
@@ -537,10 +646,13 @@ function ChatPage({
   }
 
   function stopSpeech() {
+    // Bumping the token invalidates any in-flight synthesis and playback of the previous message.
+    playTokenRef.current += 1;
     const audio = audioRef.current;
-    if (!audio) return;
-    audio.pause();
-    audio.currentTime = 0;
+    if (audio) {
+      audio.pause();
+      audio.currentTime = 0;
+    }
     audioRef.current = null;
     setSpeakingMessageId(null);
   }
@@ -548,30 +660,73 @@ function ChatPage({
   async function playSpeech(message: ChatMessage) {
     if (!message.content.trim()) return;
     stopSpeech();
+    const token = playTokenRef.current;
+    const segments = splitSpeechSegments(message.content);
+    if (segments.length === 0) return;
     setSpeakingMessageId(message.id);
-    let audio: HTMLAudioElement | null = null;
+
+    const cached = speechCacheRef.current.get(message.id);
+    const cachedSegments = cached && cached.length === segments.length ? cached : null;
+    if (!cachedSegments) speechCacheRef.current.delete(message.id);
+
+    const synthesized: SpeechSynthesisResult[] = [];
+    const pendingSynthesis = new Map<string, Promise<SpeechSynthesisResult>>();
+    function segmentSynthesis(segment: string): Promise<SpeechSynthesisResult> {
+      const existing = pendingSynthesis.get(segment);
+      if (existing) return existing;
+      const promise = synthesizeSpeech(segment);
+      // A prefetched request must not surface as an unhandled rejection when playback stops.
+      promise.catch(() => undefined);
+      pendingSynthesis.set(segment, promise);
+      return promise;
+    }
+    const isStale = () => playTokenRef.current !== token;
+
+    let currentAudio: HTMLAudioElement | null = null;
     try {
-      const cached = speechCacheRef.current.get(message.id);
-      const result = cached ?? await synthesizeSpeech(message.content);
-      if (!cached) speechCacheRef.current.set(message.id, result);
-      audio = new Audio(`data:${result.contentType};base64,${result.audioBase64}`);
-      audioRef.current = audio;
-      audio.onended = () => {
-        if (audioRef.current === audio) {
-          audioRef.current = null;
-          setSpeakingMessageId(null);
+      for (const [index, segment] of segments.entries()) {
+        const cachedResult = cachedSegments?.[index];
+        const result = cachedResult ?? await segmentSynthesis(segment);
+        if (isStale()) return;
+        if (!cachedResult) {
+          // Prefetch one segment ahead so synthesis of the next sentence overlaps playback.
+          const nextSegment = segments[index + 1];
+          if (nextSegment) void segmentSynthesis(nextSegment);
         }
-      };
-      audio.onerror = () => {
-        if (audioRef.current === audio) {
-          audioRef.current = null;
-          setSpeakingMessageId(null);
-          setNotice("语音播放失败，请重试或检查语音服务设置");
-        }
-      };
-      await audio.play();
+        synthesized.push(result);
+        const audio = new Audio(`data:${result.contentType};base64,${result.audioBase64}`);
+        currentAudio = audio;
+        audioRef.current = audio;
+        const playbackDone = new Promise<void>((resolve, reject) => {
+          audio.onended = () => {
+            if (audioRef.current === audio) audioRef.current = null;
+            resolve();
+          };
+          audio.onerror = () => {
+            if (audioRef.current === audio) audioRef.current = null;
+            reject(new Error("语音播放失败，请重试或检查语音服务设置"));
+          };
+          // stopSpeech() pauses the element instead of ending it; resolve so the loop can
+          // notice the stale token instead of waiting forever.
+          audio.onpause = () => {
+            if (isStale()) resolve();
+          };
+        });
+        // If the element errors before the loop awaits this promise, it must not become an
+        // unhandled rejection; the loop still observes the rejection at `await playbackDone`.
+        void playbackDone.catch(() => undefined);
+        await audio.play();
+        if (isStale()) return;
+        await playbackDone;
+        if (isStale()) return;
+      }
+      speechCacheRef.current.set(message.id, synthesized);
+      audioRef.current = null;
+      setSpeakingMessageId(null);
     } catch (error) {
-      if (audioRef.current === audio) audioRef.current = null;
+      // A superseded playback must not clear the state of the one that replaced it.
+      if (isStale()) return;
+      if (audioRef.current === currentAudio) audioRef.current = null;
       setSpeakingMessageId(null);
       setNotice(errorMessage(error));
     }
@@ -794,7 +949,7 @@ function ChatPage({
           const isAssistant = message.role === "assistant";
           const isFailed = message.status === "failed";
           return (
-            <article className={isAssistant ? "message message--assistant" : "message message--user"} key={message.id}>
+            <article className={isAssistant ? "message message--assistant" : "message message--user"} id={"message-" + message.id} key={message.id}>
               {isAssistant && <div className="avatar">{name.slice(0, 1)}</div>}
               <div className="message__content">
                 {isAssistant && <p className="message__name">{name}</p>}
@@ -1377,6 +1532,8 @@ export function App() {
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [persona, setPersona] = useState<PersonaProfile | null>(null);
   const [dataResetVersion, setDataResetVersion] = useState(0);
+  const dataResetVersionRef = useRef(0);
+  const [proactiveDelivery, setProactiveDelivery] = useState<ProactiveDelivery | null>(null);
   const [loaded, setLoaded] = useState(false);
   const windowLabel = getCurrentWindow().label;
   const isChatWindow = windowLabel === "chat";
@@ -1404,6 +1561,10 @@ export function App() {
     let stopListening: (() => void) | undefined;
     void listen("nova:conversation-cleared", () => {
       if (!active) return;
+      // Drop any in-memory proactive delivery so a remounted chat page cannot resurrect a
+      // message that was just cleared from the database.
+      dataResetVersionRef.current += 1;
+      setProactiveDelivery(null);
       setDataResetVersion((current) => current + 1);
     }).then((stop) => {
       if (active) stopListening = stop;
@@ -1437,49 +1598,87 @@ export function App() {
   useEffect(() => {
     if (!isChatWindow || !settings.proactiveEnabled) return;
     const activityKey = "nova:last-activity-at";
-    const dispatchKey = "nova:last-proactive-at";
     const markActive = () => localStorage.setItem(activityKey, String(Date.now()));
-    const inQuietHours = () => {
-      if (!settings.dndStart || !settings.dndEnd) return false;
-      const parse = (value: string) => Number(value.slice(0, 2)) * 60 + Number(value.slice(3, 5));
-      const [start, end] = [parse(settings.dndStart), parse(settings.dndEnd)];
-      const now = new Date(); const minute = now.getHours() * 60 + now.getMinutes();
-      return start === end || (start < end ? minute >= start && minute < end : minute >= start || minute < end);
-    };
+    let inFlight = false;
     async function checkIn() {
-      const now = Date.now();
-      const lastActive = Number(localStorage.getItem(activityKey) ?? now);
-      const lastDispatch = Number(localStorage.getItem(dispatchKey) ?? 0);
-      if (inQuietHours() || now - lastActive < 7_200_000 || now - lastDispatch < 21_600_000) return;
-      try { await showNotification("Nova", "你忙完了吗？记得喝口水，我一直都在。"); localStorage.setItem(dispatchKey, String(now)); } catch { /* retry next tick */ }
+      // Skip overlapping ticks: a slow chat completion must not double-dispatch one idle session.
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const stored = Number(localStorage.getItem(activityKey));
+        const lastActive = Number.isFinite(stored) && stored > 0 ? stored : Date.now();
+        const now = new Date();
+        const resetVersion = dataResetVersionRef.current;
+        const message = await checkInIfIdle(Math.floor(lastActive / 1000), now.getHours() * 60 + now.getMinutes());
+        if (!message || dataResetVersionRef.current !== resetVersion) return;
+        setProactiveDelivery({ message, focus: false });
+      } catch {
+        // The backend decides eligibility, DND and cooldown; a failed tick is retried on the next one.
+      } finally {
+        inFlight = false;
+      }
     }
     if (!localStorage.getItem(activityKey)) markActive();
     const events: Array<keyof DocumentEventMap> = ["pointerdown", "keydown", "touchstart"];
     events.forEach((event) => document.addEventListener(event, markActive, { passive: true }));
     const timer = window.setInterval(() => void checkIn(), 60_000);
     return () => { events.forEach((event) => document.removeEventListener(event, markActive)); window.clearInterval(timer); };
-  }, [isChatWindow, settings.dndEnd, settings.dndStart, settings.proactiveEnabled]);
+  }, [isChatWindow, settings.proactiveEnabled]);
 
   useEffect(() => {
     if (!isChatWindow) return;
     let active = true;
-    const dispatchedPrefix = "nova:reminder-dispatched:";
+    let inFlight = false;
+    async function routePendingProactive() {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const resetVersion = dataResetVersionRef.current;
+        const message = await pendingProactiveMessage();
+        if (!active || !message || dataResetVersionRef.current !== resetVersion) return;
+        setProactiveDelivery({ message, focus: true });
+        await markProactiveOpened(message.id);
+      } catch {
+        // Focus routing is best effort; a still pending message is picked up on the next focus.
+      } finally {
+        inFlight = false;
+      }
+    }
+    void routePendingProactive();
+    window.addEventListener("focus", routePendingProactive);
+    return () => { active = false; window.removeEventListener("focus", routePendingProactive); };
+  }, [isChatWindow]);
+
+  useEffect(() => {
+    if (!isChatWindow) return;
+    let active = true;
+    let inFlight = false;
     async function dispatchDueReminders() {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const now = Date.now();
-        const schedules = await listSchedules();
+        const [schedules, dispatches] = await Promise.all([listSchedules(), listReminderDispatches()]);
+        if (!active) return;
+        const dispatched = new Set(dispatches.map((item) => `${item.scheduleId}:${item.remindAt}`));
         for (const schedule of schedules) {
           if (!active || schedule.status !== "scheduled") continue;
           const remindAt = new Date(schedule.remindAt).getTime();
           if (!Number.isFinite(remindAt) || remindAt > now) continue;
-          const key = `${dispatchedPrefix}${schedule.id}:${schedule.remindAt}`;
-          if (localStorage.getItem(key)) continue;
-          await showNotification("Nova 日程提醒", `${schedule.title} · ${displayDateTime(schedule.scheduledAt)}`);
-          localStorage.setItem(key, new Date().toISOString());
+          if (dispatched.has(`${schedule.id}:${schedule.remindAt}`)) continue;
+          try {
+            await showNotification("Nova 日程提醒", `${schedule.title} · ${displayDateTime(schedule.scheduledAt)}`);
+            await markReminderDispatched(schedule.id, schedule.remindAt);
+          } catch {
+            // A failed notification or write is intentionally not marked dispatched, so this
+            // reminder is retried on the next tick without blocking the other scheduled ones.
+          }
         }
       } catch {
-        // A failed notification is intentionally not marked dispatched, so a later tick or
-        // application restart can retry without losing the reminder.
+        // A failed schedule or dispatch read retries on the next tick. Reminders are never
+        // suppressed by DND; only the persisted dispatch log decides what has been delivered.
+      } finally {
+        inFlight = false;
       }
     }
     void dispatchDueReminders();
@@ -1517,6 +1716,7 @@ export function App() {
               key={`chat-${dataResetVersion}`}
               onOpenSettings={() => void openSettingsWindow()}
               persona={persona}
+              proactiveDelivery={proactiveDelivery}
               settings={settings}
               status={status}
             />

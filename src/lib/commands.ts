@@ -142,6 +142,11 @@ export interface ScheduleCandidate {
   sourceMessageId: number;
 }
 
+export interface ReminderDispatch {
+  scheduleId: number;
+  remindAt: string;
+}
+
 export async function bootstrap(): Promise<BootstrapResponse> {
   return invoke<BootstrapResponse>("bootstrap");
 }
@@ -267,4 +272,24 @@ export async function exportLocalData(): Promise<string> {
 
 export async function showNotification(title: string, body: string): Promise<void> {
   return invoke<void>("show_notification", { title, body });
+}
+
+export async function listReminderDispatches(): Promise<ReminderDispatch[]> {
+  return invoke<ReminderDispatch[]>("list_reminder_dispatches");
+}
+
+export async function markReminderDispatched(scheduleId: number, remindAt: string): Promise<void> {
+  return invoke<void>("mark_reminder_dispatched", { scheduleId, remindAt });
+}
+
+export async function checkInIfIdle(idleStartedAt: number, localMinuteOfDay: number): Promise<ChatMessage | null> {
+  return invoke<ChatMessage | null>("check_in_if_idle", { idleStartedAt, localMinuteOfDay });
+}
+
+export async function pendingProactiveMessage(): Promise<ChatMessage | null> {
+  return invoke<ChatMessage | null>("pending_proactive_message");
+}
+
+export async function markProactiveOpened(messageId: number): Promise<void> {
+  return invoke<void>("mark_proactive_opened", { messageId });
 }
