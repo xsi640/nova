@@ -45,17 +45,19 @@ pub struct AppSettings {
     pub tts_rate: i32,
     pub tts_pitch: i32,
     pub tts_volume: i32,
-    // Volcengine gateway options.
-    pub volc_api_url: String,
+    // Volcengine (Doubao Seed-TTS 2.0) options.
+    pub volc_app_id: String,
+    pub volc_resource_id: String,
     pub volc_model: String,
     pub volc_voice: String,
-    pub volc_speed: f64,
-    /// Write-only secret; read back from the credential store instead of the database.
+    pub volc_speech_rate: i32,
+    pub volc_loudness_rate: i32,
+    /// Write-only access token; read back from the credential store instead of the database.
     #[serde(default, skip_serializing)]
-    pub volc_api_key: Option<String>,
-    /// Whether a Volcengine access key is present in the credential store.
+    pub volc_access_token: Option<String>,
+    /// Whether a Volcengine access token is present in the credential store.
     #[serde(default)]
-    pub volc_api_key_set: bool,
+    pub volc_access_token_set: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,7 +212,8 @@ impl Database {
             .query_row(
                 "SELECT theme, dark_mode, dnd_start, dnd_end, voice_autoplay, proactive_enabled,
                         tts_provider, tts_voice, tts_rate, tts_pitch, tts_volume,
-                        volc_api_url, volc_model, volc_voice, volc_speed
+                        volc_app_id, volc_resource_id, volc_model, volc_voice,
+                        volc_speech_rate, volc_loudness_rate
                  FROM app_settings WHERE id = 1",
                 [],
                 |row| {
@@ -226,12 +229,14 @@ impl Database {
                         tts_rate: row.get(8)?,
                         tts_pitch: row.get(9)?,
                         tts_volume: row.get(10)?,
-                        volc_api_url: row.get(11)?,
-                        volc_model: row.get(12)?,
-                        volc_voice: row.get(13)?,
-                        volc_speed: row.get(14)?,
-                        volc_api_key: None,
-                        volc_api_key_set: false,
+                        volc_app_id: row.get(11)?,
+                        volc_resource_id: row.get(12)?,
+                        volc_model: row.get(13)?,
+                        volc_voice: row.get(14)?,
+                        volc_speech_rate: row.get(15)?,
+                        volc_loudness_rate: row.get(16)?,
+                        volc_access_token: None,
+                        volc_access_token_set: false,
                     })
                 },
             )
@@ -253,10 +258,12 @@ impl Database {
                     tts_rate = ?9,
                     tts_pitch = ?10,
                     tts_volume = ?11,
-                    volc_api_url = ?12,
-                    volc_model = ?13,
-                    volc_voice = ?14,
-                    volc_speed = ?15
+                    volc_app_id = ?12,
+                    volc_resource_id = ?13,
+                    volc_model = ?14,
+                    volc_voice = ?15,
+                    volc_speech_rate = ?16,
+                    volc_loudness_rate = ?17
                  WHERE id = 1",
                 params![
                     settings.theme,
@@ -270,10 +277,12 @@ impl Database {
                     settings.tts_rate,
                     settings.tts_pitch,
                     settings.tts_volume,
-                    settings.volc_api_url,
+                    settings.volc_app_id,
+                    settings.volc_resource_id,
                     settings.volc_model,
                     settings.volc_voice,
-                    settings.volc_speed,
+                    settings.volc_speech_rate,
+                    settings.volc_loudness_rate,
                 ],
             )
             .map_err(|error| AppError::database(format!("failed to save settings: {error}")))?;
@@ -1092,8 +1101,9 @@ fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         let transaction = connection.transaction().map_err(|error| {
             AppError::database(format!("failed to start database migration 9: {error}"))
         })?;
-        // Volcengine (Doubao voices) joins Edge as a speech provider. The offline Piper provider
-        // is gone, so libraries that still point at `piper` fall back to the free Edge voice.
+        // Volcengine joins Edge as a speech provider. These columns held the first, OpenAI-compatible
+        // gateway attempt; migration 10 replaces them with the native protocol fields. They are left
+        // in place (unused) so older databases migrate cleanly.
         transaction
             .execute_batch(
                 "ALTER TABLE app_settings ADD COLUMN volc_api_url TEXT NOT NULL DEFAULT '';
@@ -1107,21 +1117,14 @@ fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         transaction
             .execute(
                 "UPDATE app_settings SET
-                    volc_api_url = ?1,
-                    volc_model = ?2,
-                    volc_voice = ?3,
-                    volc_speed = ?4,
-                    tts_provider = CASE WHEN tts_provider = 'piper' THEN ?5 ELSE tts_provider END,
-                    tts_voice = CASE WHEN tts_provider = 'piper' THEN ?6 ELSE tts_voice END
+                    volc_api_url = 'https://ai-gateway.vei.volces.com/v1/audio/speech',
+                    volc_model = 'doubao-tts',
+                    volc_voice = 'zh_female_shuangkuaisisi_moon_bigtts',
+                    volc_speed = 1.0,
+                    tts_provider = CASE WHEN tts_provider = 'piper' THEN ?1 ELSE tts_provider END,
+                    tts_voice = CASE WHEN tts_provider = 'piper' THEN ?2 ELSE tts_voice END
                  WHERE id = 1",
-                params![
-                    crate::volcengine_tts::DEFAULT_API_URL,
-                    crate::volcengine_tts::DEFAULT_MODEL,
-                    crate::volcengine_tts::DEFAULT_VOICE,
-                    crate::volcengine_tts::DEFAULT_SPEED,
-                    DEFAULT_TTS_PROVIDER,
-                    DEFAULT_TTS_VOICE,
-                ],
+                params![DEFAULT_TTS_PROVIDER, DEFAULT_TTS_VOICE],
             )
             .map_err(|error| {
                 AppError::database(format!("failed to apply database migration 9: {error}"))
@@ -1133,6 +1136,44 @@ fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             })?;
         transaction.commit().map_err(|error| {
             AppError::database(format!("failed to commit database migration 9: {error}"))
+        })?;
+    }
+
+    if current_version < 10 {
+        let transaction = connection.transaction().map_err(|error| {
+            AppError::database(format!("failed to start database migration 10: {error}"))
+        })?;
+        // The native Volcengine v3 WebSocket protocol needs an App ID, a resource id, a model
+        // version and rate/loudness controls. The gateway-only `volc_api_url`/`volc_speed` columns
+        // from migration 9 are superseded and no longer read.
+        transaction
+            .execute_batch(
+                "ALTER TABLE app_settings ADD COLUMN volc_app_id TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE app_settings ADD COLUMN volc_resource_id TEXT NOT NULL DEFAULT 'seed-tts-2.0';
+                 ALTER TABLE app_settings ADD COLUMN volc_speech_rate INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE app_settings ADD COLUMN volc_loudness_rate INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 10: {error}"))
+            })?;
+        transaction
+            .execute(
+                "UPDATE app_settings SET volc_model = ?1, volc_voice = ?2 WHERE id = 1",
+                params![
+                    crate::volcengine_tts::DEFAULT_MODEL,
+                    crate::volcengine_tts::DEFAULT_VOICE,
+                ],
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 10: {error}"))
+            })?;
+        transaction
+            .execute_batch("INSERT INTO schema_migrations (version) VALUES (10);")
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 10: {error}"))
+            })?;
+        transaction.commit().map_err(|error| {
+            AppError::database(format!("failed to commit database migration 10: {error}"))
         })?;
     }
 
@@ -1204,12 +1245,14 @@ mod tests {
             tts_rate: -5,
             tts_pitch: 0,
             tts_volume: 0,
-            volc_api_url: crate::volcengine_tts::DEFAULT_API_URL.to_owned(),
+            volc_app_id: "1234567890".to_owned(),
+            volc_resource_id: crate::volcengine_tts::DEFAULT_RESOURCE_ID.to_owned(),
             volc_model: crate::volcengine_tts::DEFAULT_MODEL.to_owned(),
             volc_voice: crate::volcengine_tts::DEFAULT_VOICE.to_owned(),
-            volc_speed: crate::volcengine_tts::DEFAULT_SPEED,
-            volc_api_key: None,
-            volc_api_key_set: false,
+            volc_speech_rate: 0,
+            volc_loudness_rate: 0,
+            volc_access_token: None,
+            volc_access_token_set: false,
         };
         database.save_settings(&settings).expect("save settings");
         assert_eq!(database.get_settings().expect("read settings"), settings);
@@ -1249,12 +1292,14 @@ mod tests {
             tts_rate: -5,
             tts_pitch: 0,
             tts_volume: 0,
-            volc_api_url: crate::volcengine_tts::DEFAULT_API_URL.to_owned(),
+            volc_app_id: "1234567890".to_owned(),
+            volc_resource_id: crate::volcengine_tts::DEFAULT_RESOURCE_ID.to_owned(),
             volc_model: crate::volcengine_tts::DEFAULT_MODEL.to_owned(),
             volc_voice: crate::volcengine_tts::DEFAULT_VOICE.to_owned(),
-            volc_speed: crate::volcengine_tts::DEFAULT_SPEED,
-            volc_api_key: None,
-            volc_api_key_set: false,
+            volc_speech_rate: 0,
+            volc_loudness_rate: 0,
+            volc_access_token: None,
+            volc_access_token_set: false,
         };
         database.save_settings(&settings).expect("save settings");
         let source = database

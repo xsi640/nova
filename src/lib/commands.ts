@@ -44,15 +44,17 @@ export interface AppSettings {
   ttsRate: number;
   ttsPitch: number;
   ttsVolume: number;
-  // Volcengine gateway options.
-  volcApiUrl: string;
+  // Volcengine (Doubao Seed-TTS 2.0) options.
+  volcAppId: string;
+  volcResourceId: string;
   volcModel: string;
   volcVoice: string;
-  volcSpeed: number;
-  /** Write-only access key; the backend stores it in the OS credential store. */
-  volcApiKey?: string | null;
-  /** Whether the backend already holds a Volcengine access key. */
-  volcApiKeySet: boolean;
+  volcSpeechRate: number;
+  volcLoudnessRate: number;
+  /** Write-only access token; the backend stores it in the OS credential store. */
+  volcAccessToken?: string | null;
+  /** Whether the backend already holds a Volcengine access token. */
+  volcAccessTokenSet: boolean;
 }
 
 /** Per-request speech overrides; omitted fields fall back to the saved settings. */
@@ -62,9 +64,11 @@ export interface SpeechOptions {
   rate?: number;
   pitch?: number;
   volume?: number;
-  apiUrl?: string;
+  appId?: string;
+  resourceId?: string;
   model?: string;
-  speed?: number;
+  speechRate?: number;
+  loudnessRate?: number;
   apiKey?: string;
 }
 

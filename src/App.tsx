@@ -77,12 +77,14 @@ const defaultSettings: AppSettings = {
   ttsRate: -5,
   ttsPitch: 0,
   ttsVolume: 0,
-  volcApiUrl: "https://ai-gateway.vei.volces.com/v1/audio/speech",
-  volcModel: "doubao-tts",
-  volcVoice: "zh_female_shuangkuaisisi_moon_bigtts",
-  volcSpeed: 1,
-  volcApiKey: null,
-  volcApiKeySet: false,
+  volcAppId: "",
+  volcResourceId: "seed-tts-2.0",
+  volcModel: "seed-tts-2.0-standard",
+  volcVoice: "zh_female_xiaohe_uranus_bigtts",
+  volcSpeechRate: 0,
+  volcLoudnessRate: 0,
+  volcAccessToken: null,
+  volcAccessTokenSet: false,
 };
 
 const defaultPersona: PersonaProfile = {
@@ -1204,10 +1206,14 @@ function adjustmentLabel(value: number, lower: string, higher: string): string {
 }
 
 const volcVoiceOptions = [
-  ["zh_female_shuangkuaisisi_moon_bigtts", "爽快思思 · 女声"],
-  ["zh_female_wanwanxiaohe_moon_bigtts", "湾湾小何 · 女声"],
-  ["zh_male_wennuanahu_moon_bigtts", "温暖阿虎 · 男声"],
-  ["zh_male_shaonianzixin_moon_bigtts", "少年梓辛 · 男声"],
+  ["zh_female_xiaohe_uranus_bigtts", "小何 2.0 · 女声"],
+  ["zh_female_vv_uranus_bigtts", "vivi 2.0 · 女声"],
+  ["zh_male_m191_uranus_bigtts", "云舟 2.0 · 男声"],
+  ["zh_male_taocheng_uranus_bigtts", "小天 2.0 · 男声"],
+  ["zh_female_shuangkuaisisi_uranus_bigtts", "爽快思思 2.0 · 女声"],
+  ["zh_female_cancan_uranus_bigtts", "知性灿灿 2.0 · 女声"],
+  ["zh_female_qingxinnvsheng_uranus_bigtts", "清新女声 2.0 · 女声"],
+  ["zh_female_tianmeixiaoyuan_uranus_bigtts", "甜美小源 2.0 · 女声"],
 ] as const;
 
 function TtsSettingsCard({ settings, onChange }: {
@@ -1234,10 +1240,12 @@ function TtsSettingsCard({ settings, onChange }: {
       ? {
           provider: "volcengine",
           voice: settings.volcVoice,
-          apiUrl: settings.volcApiUrl,
+          appId: settings.volcAppId,
+          resourceId: settings.volcResourceId,
           model: settings.volcModel,
-          speed: settings.volcSpeed,
-          apiKey: settings.volcApiKey ?? undefined,
+          speechRate: settings.volcSpeechRate,
+          loudnessRate: settings.volcLoudnessRate,
+          apiKey: settings.volcAccessToken ?? undefined,
         }
       : {
           provider: "edge",
@@ -1271,9 +1279,9 @@ function TtsSettingsCard({ settings, onChange }: {
     }
   }
 
-  const volcApiKeyPlaceholder = settings.volcApiKeySet
+  const volcTokenPlaceholder = settings.volcAccessTokenSet
     ? "已安全保存；留空表示不修改"
-    : "请输入火山引擎网关访问密钥";
+    : "请输入火山引擎 Access Token";
 
   return (
     <section className="settings-card tts-card">
@@ -1320,22 +1328,25 @@ function TtsSettingsCard({ settings, onChange }: {
       ) : (
         <>
           <label>
-            <span>访问密钥</span>
+            <span>App ID</span>
+            <input value={settings.volcAppId} onChange={(event) => onChange({ volcAppId: event.target.value })} />
+          </label>
+          <label>
+            <span>Access Token</span>
             <input
               autoComplete="off"
-              placeholder={volcApiKeyPlaceholder}
+              placeholder={volcTokenPlaceholder}
               type="password"
-              value={settings.volcApiKey ?? ""}
-              onChange={(event) => onChange({ volcApiKey: event.target.value })}
+              value={settings.volcAccessToken ?? ""}
+              onChange={(event) => onChange({ volcAccessToken: event.target.value })}
             />
           </label>
           <label>
-            <span>接口地址</span>
-            <input value={settings.volcApiUrl} onChange={(event) => onChange({ volcApiUrl: event.target.value })} />
-          </label>
-          <label>
-            <span>模型</span>
-            <input value={settings.volcModel} onChange={(event) => onChange({ volcModel: event.target.value })} />
+            <span>模型版本</span>
+            <select value={settings.volcModel} onChange={(event) => onChange({ volcModel: event.target.value })}>
+              <option value="seed-tts-2.0-standard">标准版（seed-tts-2.0-standard）</option>
+              <option value="seed-tts-2.0-expressive">表现力版（seed-tts-2.0-expressive）</option>
+            </select>
           </label>
           <label>
             <span>音色</span>
@@ -1345,10 +1356,14 @@ function TtsSettingsCard({ settings, onChange }: {
             </datalist>
           </label>
           <div className="tts-control">
-            <div className="tts-control__head"><strong>语速</strong><output>{settings.volcSpeed.toFixed(2)}×</output></div>
-            <input aria-label="语速" max={4} min={0.25} onChange={(event) => onChange({ volcSpeed: Number(event.target.value) })} step={0.05} type="range" value={settings.volcSpeed} />
+            <div className="tts-control__head"><strong>语速</strong><output>{adjustmentLabel(settings.volcSpeechRate, "慢一点", "快一点")}</output></div>
+            <input aria-label="语速" max={100} min={-50} onChange={(event) => onChange({ volcSpeechRate: Number(event.target.value) })} step={5} type="range" value={settings.volcSpeechRate} />
           </div>
-          <p className="tts-hint">豆包语音需在火山引擎「边缘大模型网关」开通并获取访问密钥；模型与音色可自定义。</p>
+          <div className="tts-control">
+            <div className="tts-control__head"><strong>音量</strong><output>{adjustmentLabel(settings.volcLoudnessRate, "小一点", "大一点")}</output></div>
+            <input aria-label="音量" max={100} min={-50} onChange={(event) => onChange({ volcLoudnessRate: Number(event.target.value) })} step={5} type="range" value={settings.volcLoudnessRate} />
+          </div>
+          <p className="tts-hint">使用火山引擎豆包语音合成 2.0（WebSocket）；在火山「语音技术」控制台开通并获取 App ID 与 Access Token，资源 ID 默认 seed-tts-2.0。</p>
         </>
       )}
 
