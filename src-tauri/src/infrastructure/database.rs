@@ -37,6 +37,8 @@ pub struct AppSettings {
     pub dnd_end: Option<String>,
     pub voice_autoplay: bool,
     pub proactive_enabled: bool,
+    /// When set, chat requests ask the model to think less so the first token arrives sooner.
+    pub chat_fast_mode: bool,
     /// `edge` (online, default) or `volcengine` (Doubao voices through the Volcengine gateway).
     #[serde(default = "default_tts_provider")]
     pub tts_provider: String,
@@ -212,7 +214,7 @@ impl Database {
                 "SELECT theme, dark_mode, dnd_start, dnd_end, voice_autoplay, proactive_enabled,
                         tts_provider, tts_voice, tts_rate, tts_pitch, tts_volume,
                         volc_resource_id, volc_model, volc_voice,
-                        volc_speech_rate, volc_loudness_rate
+                        volc_speech_rate, volc_loudness_rate, chat_fast_mode
                  FROM app_settings WHERE id = 1",
                 [],
                 |row| {
@@ -233,6 +235,7 @@ impl Database {
                         volc_voice: row.get(13)?,
                         volc_speech_rate: row.get(14)?,
                         volc_loudness_rate: row.get(15)?,
+                        chat_fast_mode: row.get::<_, i64>(16)? != 0,
                         volc_api_key: None,
                         volc_api_key_set: false,
                     })
@@ -260,7 +263,8 @@ impl Database {
                     volc_model = ?13,
                     volc_voice = ?14,
                     volc_speech_rate = ?15,
-                    volc_loudness_rate = ?16
+                    volc_loudness_rate = ?16,
+                    chat_fast_mode = ?17
                  WHERE id = 1",
                 params![
                     settings.theme,
@@ -279,6 +283,7 @@ impl Database {
                     settings.volc_voice,
                     settings.volc_speech_rate,
                     settings.volc_loudness_rate,
+                    settings.chat_fast_mode,
                 ],
             )
             .map_err(|error| AppError::database(format!("failed to save settings: {error}")))?;
@@ -1194,6 +1199,25 @@ fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         })?;
     }
 
+    if current_version < 12 {
+        let transaction = connection.transaction().map_err(|error| {
+            AppError::database(format!("failed to start database migration 12: {error}"))
+        })?;
+        // Chat can ask the model to think less so the first token arrives sooner.
+        transaction
+            .execute_batch(
+                "ALTER TABLE app_settings ADD COLUMN chat_fast_mode INTEGER NOT NULL DEFAULT 0
+                    CHECK (chat_fast_mode IN (0, 1));
+                 INSERT INTO schema_migrations (version) VALUES (12);",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 12: {error}"))
+            })?;
+        transaction.commit().map_err(|error| {
+            AppError::database(format!("failed to commit database migration 12: {error}"))
+        })?;
+    }
+
     Ok(())
 }
 
@@ -1267,6 +1291,7 @@ mod tests {
             volc_voice: crate::volcengine_tts::DEFAULT_VOICE.to_owned(),
             volc_speech_rate: 0,
             volc_loudness_rate: 0,
+            chat_fast_mode: false,
             volc_api_key: None,
             volc_api_key_set: false,
         };
@@ -1313,6 +1338,7 @@ mod tests {
             volc_voice: crate::volcengine_tts::DEFAULT_VOICE.to_owned(),
             volc_speech_rate: 0,
             volc_loudness_rate: 0,
+            chat_fast_mode: false,
             volc_api_key: None,
             volc_api_key_set: false,
         };

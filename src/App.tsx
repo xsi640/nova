@@ -71,6 +71,7 @@ const defaultSettings: AppSettings = {
   dndEnd: "08:00",
   voiceAutoplay: true,
   proactiveEnabled: true,
+  chatFastMode: false,
   ttsProvider: "edge",
   ttsVoice: "zh-CN-XiaoxiaoNeural",
   ttsRate: -5,
@@ -1449,6 +1450,22 @@ function SettingsPage({ settings, persona, onSettingsSaved, onPersonaSaved }: {
             onChange={(changes) => setSettingsDraft({ ...settingsDraft, ...changes })}
             settings={settingsDraft}
           />
+
+          <section className="settings-card">
+            <span className="section-tag">对话</span>
+            <h2>回复速度</h2>
+            <div className="setting-row">
+              <div>
+                <strong>快速回复</strong>
+                <small>让推理型模型少“想”一点，首句来得更快；若模型不支持会报错，请关闭</small>
+              </div>
+              <Toggle
+                checked={settingsDraft.chatFastMode}
+                label="快速回复"
+                onChange={(chatFastMode) => setSettingsDraft({ ...settingsDraft, chatFastMode })}
+              />
+            </div>
+          </section>
         </div>
 
         <div className="settings-column">

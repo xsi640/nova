@@ -57,6 +57,7 @@ HKCU\SOFTWARE\Microsoft\GameBar : AutoGameModeEnabled=0, ShowStartupPanel=0, Use
 - 后端新增 `send_message_stream(database, content, on_event: Channel<String>) -> ChatExchange`：`request_chat_completion_stream` 用 `stream: true` 调对话 API，逐条解析 SSE（`data: {...}` / `[DONE]`），每段文本增量通过 Channel 推送；结束后仍返回持久化后的 `ChatExchange`（避免事件与命令返回的投递顺序竞争）。若端点忽略 `stream` 返回普通 JSON，则回退解析非流式响应。
 - 前端 `submitMessage` 改成：用户消息立即上屏 → 对话增量逐字渲染到一条临时助手消息 → 同时把增量喂给 `createLiveSpeech`（`src/lib/speechPlayer.ts`）：按句边界缓冲，每凑够一句就立即合成并播放，于是回复一边生成一边朗读。完成后用真实消息替换临时消息。
 - 弃用并删除旧的 `send_message`（`retry_message` 仍是非流式）。
+- 延迟优化：`http_client()` 改为共享客户端（连接池复用）；历史上下文限为 **16 条 / 6000 字符**（`recent_remote_messages`）；设置页新增「快速回复」开关（`chat_fast_mode`，迁移 12），开启时请求带 `reasoning_effort: "low"`；「边说边生成」的开口阈值从 24 字降到 14 字。
 
 ## 3. 尚未完成 / 待确认
 

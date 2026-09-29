@@ -129,7 +129,7 @@ export interface LiveSpeech {
 }
 
 const SENTENCE_ENDERS = "。！？!?；;\n";
-const MIN_SEGMENT_LENGTH = 24;
+const MIN_SEGMENT_LENGTH = 14;
 const MAX_SEGMENT_LENGTH = 200;
 
 /**

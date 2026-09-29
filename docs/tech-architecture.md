@@ -95,7 +95,7 @@ React UI
 | memories | id、content、source_message_id、created_at、updated_at | 自动形成且可人工管理的长期记忆 |
 | schedules | id、title、scheduled_at、remind_at、source_message_id、status | 应用内日程及其提醒状态 |
 | proactive_events | id、message_id、idle_started_at、notified_at、opened_at | 主动陪伴消息与通知状态 |
-| app_settings | theme、dark_mode、dnd_start、dnd_end、voice_autoplay、tts_provider、tts_voice、tts_rate、tts_pitch、tts_volume、volc_resource_id、volc_model、volc_voice、volc_speech_rate、volc_loudness_rate、onboarding_required | 非敏感应用行为、语音合成设置（`tts_provider` 为 `edge` / `volcengine`，两种方式的参数各自保留）及保留的恢复引导状态 |
+| app_settings | theme、dark_mode、dnd_start、dnd_end、voice_autoplay、proactive_enabled、chat_fast_mode、tts_provider、tts_voice、tts_rate、tts_pitch、tts_volume、volc_resource_id、volc_model、volc_voice、volc_speech_rate、volc_loudness_rate、onboarding_required | 非敏感应用行为、对话/语音合成设置（`chat_fast_mode` 让推理模型 `reasoning_effort=low`）及保留的恢复引导状态 |
 
 ### 本地存储与密钥策略
 

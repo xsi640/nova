@@ -38,6 +38,8 @@ export interface AppSettings {
   dndEnd: string | null;
   voiceAutoplay: boolean;
   proactiveEnabled: boolean;
+  /** Ask the model to think less so replies start sooner. */
+  chatFastMode: boolean;
   ttsProvider: TtsProvider;
   // Edge voice options.
   ttsVoice: string;

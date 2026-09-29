@@ -421,6 +421,8 @@ struct ChatCompletionRequest {
     messages: Vec<RemoteChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -777,6 +779,7 @@ async fn generate_proactive_message(
         model: profile.model,
         messages,
         stream: None,
+        reasoning_effort: None,
     };
     let reply = match tauri::async_runtime::spawn_blocking(move || {
         request_chat_completion(&endpoint, &api_key, &request)
@@ -942,10 +945,12 @@ async fn complete_chat(
                 .collect(),
         ));
         let endpoint = format!("{}{}", profile.base_url.trim_end_matches('/'), profile.path);
+        let fast_mode = database.get_settings()?.chat_fast_mode;
         let request = ChatCompletionRequest {
             model: profile.model,
             messages,
             stream: None,
+            reasoning_effort: fast_mode.then(|| "low".to_owned()),
         };
         let reply = tauri::async_runtime::spawn_blocking(move || {
             request_chat_completion(&endpoint, &api_key, &request)
@@ -1002,10 +1007,12 @@ async fn complete_chat_stream(
                 .collect(),
         ));
         let endpoint = format!("{}{}", profile.base_url.trim_end_matches('/'), profile.path);
+        let fast_mode = database.get_settings()?.chat_fast_mode;
         let request = ChatCompletionRequest {
             model: profile.model,
             messages,
             stream: Some(true),
+            reasoning_effort: fast_mode.then(|| "low".to_owned()),
         };
         let stream_events = on_event.clone();
         let reply = tauri::async_runtime::spawn_blocking(move || {
@@ -1656,6 +1663,7 @@ mod tests {
             model: "test-model".to_owned(),
             messages: Vec::new(),
             stream: Some(true),
+            reasoning_effort: None,
         };
         let mut deltas = Vec::new();
         let reply = super::request_chat_completion_stream(
