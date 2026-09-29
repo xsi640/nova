@@ -107,7 +107,7 @@ pub fn run() {
             commands::save_api_profile,
             commands::test_api_profile,
             commands::list_messages,
-            commands::send_message,
+            commands::send_message_stream,
             commands::retry_message,
             commands::list_memories,
             commands::update_memory,

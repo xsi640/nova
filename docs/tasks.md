@@ -45,6 +45,7 @@ TASK-001 项目骨架
 | TASK-015 | 完成 Windows/macOS 平台适配与最小回归验证 | MODULE-007 | TASK-004、TASK-007、TASK-008、TASK-011、TASK-012、TASK-014 | 在 Windows 10/11 x64 与 macOS 13+ Intel/Apple Silicon 各验证直接运行、数据库打开、凭据访问、麦克风、通知、后台驻留和空闲检测；记录平台差异与已知限制 | 待处理 |
 | TASK-016 | 优化 TTS 语音合成与播放延时 | MODULE-002 | TASK-008、TASK-014 | 量化“触发朗读/收到回复”到“首帧音频播放”的延时并显著降低；消除长文本等待整段合成、base64 全量传输造成的额外等待；音色、语速等设置语义与播放失败回退行为保持不变 | 待验证 |
 | TASK-017 | 增加语音方式选择与火山引擎豆包语音 | MODULE-002 | TASK-008、TASK-014 | 设置页先选择语音方式（Edge 在线 / 火山引擎），再配置该方式的参数；火山引擎走原生 v3 双向流式 WebSocket（`wss://openspeech.bytedance.com/api/v3/tts/bidirection`，资源 `seed-tts-2.0`，模型默认 `seed-tts-2.0-standard`），用新控制台单个 API Key（`X-Api-Key`，存系统凭据存储）+ 模型 / 音色 / 语速 / 音量；需人工在 UI 中走查两种方式的试听与聊天朗读 | 待验证 |
+| TASK-018 | 流式对话与边说边生成 | MODULE-002 | TASK-008、TASK-016 | 对话按 SSE 流式返回文本增量（`send_message_stream`，Tauri Channel），前端逐字渲染回复并在句子完成时立即开始朗读，让回复与语音同步自然；流式不可用时回退到非流式响应；需人工走查实际对话体验 | 待验证 |
 
 ## 3. 任务依赖与并行分组
 
@@ -87,7 +88,7 @@ TASK-007 完成即达到最小可运行闭环。
 |---|---|
 | 待处理 | TASK-015 |
 | 进行中 | 无 |
-| 待验证 | TASK-016、TASK-017 |
+| 待验证 | TASK-016、TASK-017、TASK-018 |
 | 已完成 | TASK-001 ～ TASK-014 |
 | 已阻塞 | 无 |
 

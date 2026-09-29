@@ -52,11 +52,17 @@ HKCU\SOFTWARE\Microsoft\GameBar : AutoGameModeEnabled=0, ShowStartupPanel=0, Use
 ```
 `tauri.conf.json` 仍保留 `additionalBrowserArgs`（含 `EnableWindowsGamingInputDataFetcher`），作为手柄路径的额外保险。
 
+### 2.5 流式对话（边说边生成）
+
+- 后端新增 `send_message_stream(database, content, on_event: Channel<String>) -> ChatExchange`：`request_chat_completion_stream` 用 `stream: true` 调对话 API，逐条解析 SSE（`data: {...}` / `[DONE]`），每段文本增量通过 Channel 推送；结束后仍返回持久化后的 `ChatExchange`（避免事件与命令返回的投递顺序竞争）。若端点忽略 `stream` 返回普通 JSON，则回退解析非流式响应。
+- 前端 `submitMessage` 改成：用户消息立即上屏 → 对话增量逐字渲染到一条临时助手消息 → 同时把增量喂给 `createLiveSpeech`（`src/lib/speechPlayer.ts`）：按句边界缓冲，每凑够一句就立即合成并播放，于是回复一边生成一边朗读。完成后用真实消息替换临时消息。
+- 弃用并删除旧的 `send_message`（`retry_message` 仍是非流式）。
+
 ## 3. 尚未完成 / 待确认
 
 1. **UI 人工走查**：流式播放（试听、聊天朗读、自动播放、中途停止）未由本人点击验证。
 2. **未用真实火山凭证做联网合成**（本机没有 API Key）。
-3. **首帧延时量测**：TASK-016 需要按固定文本记录优化前后对比后才能标记完成。
+3. **首帧延时量测**：TASK-016 需要按固定文本记录优化前后对比后才能标记完成；TASK-018 的流式对话体验需人工走查。
 4. Edge 仍是每个 4096 字节分片新建一次 WebSocket 连接；如需再降延迟可复用单条连接。
 5. 遗留 `%APPDATA%\app.nova.companion\piper\`（旧 Piper 运行时/音色）可删。
 

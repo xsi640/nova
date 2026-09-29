@@ -116,3 +116,113 @@ function base64ToBytes(value: string): ArrayBuffer {
   }
   return buffer;
 }
+
+export interface LiveSpeech {
+  /** Appends a streamed text delta; complete sentences are spoken as they arrive. */
+  push(text: string): void;
+  /** Flushes the trailing text and lets the queue drain. */
+  finish(): void;
+  /** Stops playback and drops anything still queued. */
+  stop(): void;
+  /** Resolves when the queue has drained. */
+  done: Promise<void>;
+}
+
+const SENTENCE_ENDERS = "。！？!?；;\n";
+const MIN_SEGMENT_LENGTH = 24;
+const MAX_SEGMENT_LENGTH = 200;
+
+/**
+ * Speaks a model reply while it is still being generated. Deltas are buffered into sentences and
+ * each completed sentence is synthesized and played in order, so the companion starts talking
+ * before the full answer exists.
+ */
+export function createLiveSpeech(options: SpeechOptions | undefined): LiveSpeech {
+  let buffer = "";
+  const queue: string[] = [];
+  let finished = false;
+  let stopped = false;
+  let running = false;
+  let current: StreamingSpeech | null = null;
+  let resolveDone!: () => void;
+  const done = new Promise<void>((resolve) => {
+    resolveDone = resolve;
+  });
+
+  async function run() {
+    if (running) return;
+    running = true;
+    while (!stopped) {
+      const next = queue.shift();
+      if (next === undefined) break;
+      const speech = playStreamingSpeech(next, options);
+      current = speech;
+      try {
+        await speech.done;
+      } catch {
+        // One failed sentence should not abort the rest of the reply.
+      }
+      current = null;
+    }
+    running = false;
+    if (stopped || (finished && queue.length === 0)) resolveDone();
+  }
+
+  function enqueue(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    queue.push(trimmed);
+    void run();
+  }
+
+  function drainBuffer() {
+    while (!stopped) {
+      let cut = -1;
+      for (let index = MIN_SEGMENT_LENGTH - 1; index < buffer.length; index += 1) {
+        const character = buffer[index];
+        if (character !== undefined && SENTENCE_ENDERS.includes(character)) {
+          cut = index;
+          break;
+        }
+      }
+      if (cut < 0) {
+        if (buffer.length < MAX_SEGMENT_LENGTH) break;
+        const window = buffer.slice(0, MAX_SEGMENT_LENGTH);
+        const soft = Math.max(
+          window.lastIndexOf("，"),
+          window.lastIndexOf(","),
+          window.lastIndexOf("、"),
+          window.lastIndexOf(" "),
+        );
+        cut = soft > 0 ? soft : MAX_SEGMENT_LENGTH - 1;
+      }
+      enqueue(buffer.slice(0, cut + 1));
+      buffer = buffer.slice(cut + 1);
+    }
+  }
+
+  return {
+    push(text) {
+      if (stopped || finished) return;
+      buffer += text;
+      drainBuffer();
+    },
+    finish() {
+      if (stopped || finished) return;
+      finished = true;
+      if (buffer.trim()) {
+        enqueue(buffer);
+        buffer = "";
+      }
+      if (!running) resolveDone();
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      queue.length = 0;
+      current?.stop();
+      resolveDone();
+    },
+    done,
+  };
+}

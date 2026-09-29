@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    io::{BufRead, BufReader},
+    time::{Duration, Instant},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use reqwest::{
@@ -415,6 +418,8 @@ pub struct ChatExchange {
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<RemoteChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -436,6 +441,21 @@ struct ChatCompletionChoice {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionMessage {
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionChunk {
+    choices: Vec<ChatCompletionChunkChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionChunkChoice {
+    delta: ChatCompletionDelta,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionDelta {
+    content: Option<String>,
 }
 
 #[tauri::command]
@@ -755,6 +775,7 @@ async fn generate_proactive_message(
     let request = ChatCompletionRequest {
         model: profile.model,
         messages,
+        stream: None,
     };
     let reply = match tauri::async_runtime::spawn_blocking(move || {
         request_chat_completion(&endpoint, &api_key, &request)
@@ -838,13 +859,14 @@ pub fn get_schedule_candidate(
 }
 
 #[tauri::command]
-pub async fn send_message(
+pub async fn send_message_stream(
     database: State<'_, Database>,
     content: String,
+    on_event: Channel<String>,
 ) -> Result<ChatExchange, CommandError> {
     let content = required_text("消息", content, 8_000)?;
     let user_message = database.insert_chat_message("user", &content, "pending")?;
-    complete_chat(&database, user_message).await
+    complete_chat_stream(&database, user_message, on_event).await
 }
 
 #[tauri::command]
@@ -908,9 +930,85 @@ async fn complete_chat(
         let request = ChatCompletionRequest {
             model: profile.model,
             messages,
+            stream: None,
         };
         let reply = tauri::async_runtime::spawn_blocking(move || {
             request_chat_completion(&endpoint, &api_key, &request)
+        })
+        .await
+        .map_err(|error| AppError::internal(format!("对话任务失败：{error}")))??;
+
+        database.update_chat_message_status(user_message.id, "sent")?;
+        let user_message = ChatMessage {
+            status: "sent".to_owned(),
+            ..user_message.clone()
+        };
+        let assistant_message = database.insert_chat_message("assistant", &reply, "sent")?;
+        persist_memory_candidate(database, &user_message);
+        Ok(ChatExchange {
+            user_message,
+            assistant_message,
+        })
+    }
+    .await;
+
+    if result.is_err() {
+        database.update_chat_message_status(user_message.id, "failed")?;
+    }
+    result
+}
+
+async fn complete_chat_stream(
+    database: &Database,
+    user_message: ChatMessage,
+    on_event: Channel<String>,
+) -> Result<ChatExchange, CommandError> {
+    let result = async {
+        let profile = database
+            .get_api_profile("chat")?
+            .filter(|profile| profile.enabled)
+            .ok_or_else(|| AppError::Configuration("请先配置并启用对话 API".to_owned()))?;
+        let api_key = credentials::get_secret(&profile.secret_ref)?;
+        let persona = database
+            .get_persona()?
+            .ok_or_else(|| AppError::Configuration("请先完成角色设定".to_owned()))?;
+        let mut messages = vec![RemoteChatMessage {
+            role: "system".to_owned(),
+            content: build_system_prompt(&persona),
+        }];
+        messages.extend(
+            database
+                .list_chat_messages()?
+                .into_iter()
+                .filter(|message| {
+                    (message.status == "sent" || message.id == user_message.id)
+                        && matches!(message.role.as_str(), "user" | "assistant")
+                })
+                .rev()
+                .take(40)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|message| RemoteChatMessage {
+                    role: message.role,
+                    content: message.content,
+                }),
+        );
+        let endpoint = format!("{}{}", profile.base_url.trim_end_matches('/'), profile.path);
+        let request = ChatCompletionRequest {
+            model: profile.model,
+            messages,
+            stream: Some(true),
+        };
+        let stream_events = on_event.clone();
+        let reply = tauri::async_runtime::spawn_blocking(move || {
+            request_chat_completion_stream(&endpoint, &api_key, &request, &mut |delta| {
+                stream_events
+                    .send(delta.to_owned())
+                    .map_err(|error| {
+                        AppError::internal(format!("发送对话数据失败：{error}")).into()
+                    })
+            })
         })
         .await
         .map_err(|error| AppError::internal(format!("对话任务失败：{error}")))??;
@@ -1026,6 +1124,79 @@ fn request_chat_completion(
         .filter(|content| !content.is_empty())
         .ok_or_else(|| AppError::Service("对话 API 没有返回文字内容".to_owned()))?;
     Ok(content)
+}
+
+fn request_chat_completion_stream(
+    url: &str,
+    api_key: &str,
+    request: &ChatCompletionRequest,
+    on_delta: &mut dyn FnMut(&str) -> Result<(), CommandError>,
+) -> Result<String, CommandError> {
+    let client = http_client(Duration::from_secs(180))?;
+    let response = client
+        .post(url)
+        .bearer_auth(api_key)
+        .json(request)
+        .send()
+        .map_err(|error| AppError::Network(format!("发送消息失败：{error}")))?;
+    let status = response.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(AppError::Authorization("API Key 无效或没有访问权限".to_owned()).into());
+    }
+    if !status.is_success() {
+        return Err(AppError::Service(format!("对话 API 返回状态码 {}", status.as_u16())).into());
+    }
+
+    let mut reader = BufReader::new(response);
+    let mut line = String::new();
+    let mut reply = String::new();
+    let mut raw = String::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| AppError::Network(format!("读取对话响应失败：{error}")))?;
+        if read == 0 {
+            break;
+        }
+        raw.push_str(&line);
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            break;
+        }
+        if data.is_empty() {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<ChatCompletionChunk>(data) else {
+            continue;
+        };
+        if let Some(content) = chunk
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|choice| choice.delta.content)
+        {
+            if !content.is_empty() {
+                reply.push_str(&content);
+                on_delta(&content)?;
+            }
+        }
+    }
+
+    let reply = reply.trim().to_owned();
+    if !reply.is_empty() {
+        return Ok(reply);
+    }
+    // Fall back to a non-streaming body if the endpoint ignored `stream: true`.
+    let fallback = serde_json::from_str::<ChatCompletionResponse>(raw.trim())
+        .ok()
+        .and_then(|response| response.choices.into_iter().next())
+        .map(|choice| choice.message.content.trim().to_owned())
+        .filter(|content| !content.is_empty());
+    fallback.ok_or_else(|| AppError::Service("对话 API 没有返回文字内容".to_owned()).into())
 }
 
 fn http_client(timeout: Duration) -> Result<reqwest::blocking::Client, CommandError> {
@@ -1408,7 +1579,7 @@ mod tests {
 
     use crate::error::ErrorCategory;
 
-    use super::{BootstrapResponse, TtsStreamEvent};
+    use super::{BootstrapResponse, ChatCompletionRequest, TtsStreamEvent};
     use crate::infrastructure::database::PersonaProfile;
 
     #[test]
@@ -1426,6 +1597,47 @@ mod tests {
         .expect("chunk serializes");
         assert_eq!(chunk["type"], "chunk");
         assert_eq!(chunk["data"], "abc");
+    }
+
+    #[test]
+    fn parses_chat_completion_stream_deltas() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock stream API");
+        let address = listener.local_addr().expect("mock stream address");
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).expect("read request");
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}\n\n\
+                        data: {\"choices\":[{\"delta\":{\"content\":\"，世界\"}}]}\n\n\
+                        data: [DONE]\n\n";
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+        });
+
+        let request = ChatCompletionRequest {
+            model: "test-model".to_owned(),
+            messages: Vec::new(),
+            stream: Some(true),
+        };
+        let mut deltas = Vec::new();
+        let reply = super::request_chat_completion_stream(
+            &format!("http://{address}/v1/chat/completions"),
+            "test-secret",
+            &request,
+            &mut |delta| {
+                deltas.push(delta.to_owned());
+                Ok(())
+            },
+        )
+        .expect("streams the reply");
+
+        assert_eq!(reply, "你好，世界");
+        assert_eq!(deltas, vec!["你好".to_owned(), "，世界".to_owned()]);
+        handle.join().expect("mock stream server");
     }
 
     fn mock_api(status: &str) -> (String, thread::JoinHandle<()>) {

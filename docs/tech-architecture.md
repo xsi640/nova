@@ -122,7 +122,7 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 |---|---|---|---|
 | 本地命令 | bootstrap | MODULE-001、MODULE-008 | 读取窗口状态及数据清空后是否需要引导 |
 | 本地命令 | save_persona、get_persona | MODULE-001 | 管理虚拟女友设定 |
-| 本地命令 | send_message、transcribe_audio、synthesize_speech_stream | MODULE-002 | 文字与语音交互；合成通过 Tauri Channel 流式返回音频帧 |
+| 本地命令 | send_message_stream、transcribe_audio、synthesize_speech_stream | MODULE-002 | 文字与语音交互；对话文本与合成音频都通过 Tauri Channel 流式返回 |
 | 本地命令 | list_memories、update_memory、delete_memory、export_data | MODULE-003、MODULE-006 | 管理与导出数据 |
 | 本地命令 | confirm_schedule、list_schedules、update_schedule、delete_schedule | MODULE-005 | 管理应用内日程 |
 | 本地命令 | save_api_profile、test_api_profile、get_api_profile_status | MODULE-008 | 配置、测试和读取脱敏 API 状态 |

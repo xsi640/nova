@@ -225,8 +225,13 @@ export async function listMessages(): Promise<ChatMessage[]> {
   return invoke<ChatMessage[]>("list_messages");
 }
 
-export async function sendMessage(content: string): Promise<ChatExchange> {
-  return invoke<ChatExchange>("send_message", { content });
+export async function sendMessageStream(
+  content: string,
+  onDelta: (text: string) => void,
+): Promise<ChatExchange> {
+  const channel = new Channel<string>();
+  channel.onmessage = onDelta;
+  return invoke<ChatExchange>("send_message_stream", { content, onEvent: channel });
 }
 
 export async function retryMessage(messageId: number): Promise<ChatExchange> {

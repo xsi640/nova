@@ -28,7 +28,7 @@ import {
   saveApiProfile,
   savePersona,
   saveSettings,
-  sendMessage,
+  sendMessageStream,
   showNotification,
   testApiProfile,
   transcribeAudio,
@@ -50,7 +50,7 @@ import {
   updateMemory,
   updateSchedule,
 } from "./lib/commands";
-import { playStreamingSpeech, type StreamingSpeech } from "./lib/speechPlayer";
+import { createLiveSpeech, playStreamingSpeech } from "./lib/speechPlayer";
 
 type Page = "memory" | "schedule" | "settings";
 
@@ -219,6 +219,20 @@ function errorMessage(error: unknown): string {
 /** Pending sends use negative temporary ids; they must sort after persisted messages. */
 function messageOrderKey(id: number): number {
   return id < 0 ? Number.MAX_SAFE_INTEGER : id;
+}
+
+/** Inserts or updates the assistant message while its text is still streaming in. */
+function upsertStreamingAssistant(messages: ChatMessage[], id: number, content: string): ChatMessage[] {
+  if (messages.some((message) => message.id === id)) {
+    return messages.map((message) => message.id === id ? { ...message, content } : message);
+  }
+  return [...messages, {
+    id,
+    role: "assistant",
+    content,
+    createdAt: new Date().toISOString(),
+    status: "sent",
+  }];
 }
 
 function MarkdownMessage({ content }: { content: string }) {
@@ -526,7 +540,7 @@ function ChatPage({
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
-  const speechRef = useRef<StreamingSpeech | null>(null);
+  const speechRef = useRef<{ stop(): void } | null>(null);
   const playTokenRef = useRef(0);
 
   useEffect(() => {
@@ -573,9 +587,9 @@ function ChatPage({
     target.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [focusMessageId, messages]);
 
-  function mergeExchange(exchange: ChatExchange, temporaryId?: number) {
+  function mergeExchange(exchange: ChatExchange, ...temporaryIds: number[]) {
     setMessages((current) => [
-      ...current.filter((message) => message.id !== temporaryId && message.id !== exchange.userMessage.id),
+      ...current.filter((message) => !temporaryIds.includes(message.id) && message.id !== exchange.userMessage.id),
       exchange.userMessage,
       exchange.assistantMessage,
     ].sort((left, right) => left.id - right.id));
@@ -642,6 +656,7 @@ function ChatPage({
     if (!content || sending) return;
 
     const temporaryId = -Date.now();
+    const streamingAssistantId = temporaryId - 1;
     setDraft("");
     setNotice(null);
     setSending(true);
@@ -653,12 +668,38 @@ function ChatPage({
       status: "pending",
     }]);
 
+    // Speak the reply while it is still being generated.
+    const live = settings.voiceAutoplay ? createLiveSpeech(undefined) : null;
+    if (live) {
+      speechRef.current = live;
+      setSpeakingMessageId(streamingAssistantId);
+    }
+    let streamed = "";
+
     try {
-      const exchange = await sendMessage(content);
-      mergeExchange(exchange, temporaryId);
+      const exchange = await sendMessageStream(content, (delta) => {
+        streamed += delta;
+        live?.push(delta);
+        setMessages((current) => upsertStreamingAssistant(current, streamingAssistantId, streamed));
+      });
+      mergeExchange(exchange, temporaryId, streamingAssistantId);
+      live?.finish();
       void discoverScheduleCandidate(exchange.userMessage);
-      if (settings.voiceAutoplay) void playSpeech(exchange.assistantMessage);
+      if (live) {
+        setSpeakingMessageId(exchange.assistantMessage.id);
+        void live.done.finally(() => {
+          if (speechRef.current === live) {
+            speechRef.current = null;
+            setSpeakingMessageId(null);
+          }
+        });
+      }
     } catch (error) {
+      live?.stop();
+      if (speechRef.current === live) {
+        speechRef.current = null;
+        setSpeakingMessageId(null);
+      }
       setNotice(errorMessage(error));
       try {
         await refreshMessages();
@@ -1089,7 +1130,7 @@ function TtsSettingsCard({ settings, onChange }: {
 }) {
   const [previewing, setPreviewing] = useState(false);
   const [previewNotice, setPreviewNotice] = useState<string | null>(null);
-  const previewRef = useRef<StreamingSpeech | null>(null);
+  const previewRef = useRef<{ stop(): void } | null>(null);
 
   useEffect(() => () => previewRef.current?.stop(), []);
 
