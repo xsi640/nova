@@ -29,6 +29,8 @@ export interface PersonaProfile {
   personality: string;
 }
 
+export type TtsProvider = "piper" | "edge";
+
 export interface AppSettings {
   theme: "rose" | "lavender" | "mint" | "blue" | "peach";
   darkMode: boolean;
@@ -36,6 +38,7 @@ export interface AppSettings {
   dndEnd: string | null;
   voiceAutoplay: boolean;
   proactiveEnabled: boolean;
+  ttsProvider: TtsProvider;
   ttsVoice: string;
   ttsRate: number;
   ttsPitch: number;
@@ -47,6 +50,33 @@ export interface TtsOptions {
   rate: number;
   pitch: number;
   volume: number;
+}
+
+export interface PiperVoiceStatus {
+  id: string;
+  label: string;
+  note: string;
+  license: string;
+  installed: boolean;
+  downloadBytes: number;
+}
+
+export interface PiperStatus {
+  supported: boolean;
+  runtimeReady: boolean;
+  runtimeVersion: string;
+  runtimeProvider: string;
+  runtimeUrl: string;
+  runtimeBytes: number;
+  defaultVoice: string;
+  voices: PiperVoiceStatus[];
+  pendingBytes: number;
+}
+
+export interface PiperInstallProgress {
+  phase: "runtime" | "voice";
+  receivedBytes: number;
+  totalBytes: number;
 }
 
 export type WindowMode = "compact" | "management";
@@ -221,8 +251,20 @@ export async function transcribeAudio(
   return invoke<TranscriptionResult>("transcribe_audio", { audio, fileName, mimeType });
 }
 
-export async function synthesizeSpeech(text: string, options?: TtsOptions): Promise<SpeechSynthesisResult> {
-  return invoke<SpeechSynthesisResult>("synthesize_speech", { text, options });
+export async function synthesizeSpeech(
+  text: string,
+  options?: TtsOptions,
+  provider?: TtsProvider,
+): Promise<SpeechSynthesisResult> {
+  return invoke<SpeechSynthesisResult>("synthesize_speech", { text, options, provider });
+}
+
+export async function getPiperStatus(): Promise<PiperStatus> {
+  return invoke<PiperStatus>("get_piper_status");
+}
+
+export async function installPiperVoice(voiceId: string): Promise<PiperStatus> {
+  return invoke<PiperStatus>("install_piper_voice", { voiceId });
 }
 
 export async function listMemories(): Promise<MemoryRecord[]> {

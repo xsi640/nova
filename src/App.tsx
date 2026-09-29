@@ -8,6 +8,7 @@ import {
   checkInIfIdle,
   getApiProfileStatus,
   getPersona,
+  getPiperStatus,
   getSettings,
   confirmSchedule,
   clearConversationData,
@@ -15,6 +16,7 @@ import {
   deleteSchedule,
   exportLocalData,
   finishOnboarding,
+  installPiperVoice,
   getScheduleCandidate,
   listMemories,
   listMessages,
@@ -44,10 +46,13 @@ import {
   type ConfirmScheduleInput,
   type MemoryRecord,
   type PersonaProfile,
+  type PiperInstallProgress,
+  type PiperStatus,
   type ScheduleRecord,
   type ScheduleCandidate,
   type ScheduleStatus,
   type SpeechSynthesisResult,
+  type TtsProvider,
   updateMemory,
   updateSchedule,
 } from "./lib/commands";
@@ -71,7 +76,8 @@ const defaultSettings: AppSettings = {
   dndEnd: "08:00",
   voiceAutoplay: true,
   proactiveEnabled: true,
-  ttsVoice: "zh-CN-XiaoxiaoNeural",
+  ttsProvider: "piper",
+  ttsVoice: "zh_CN-huayan-medium",
   ttsRate: -5,
   ttsPitch: 0,
   ttsVolume: 0,
@@ -1195,15 +1201,80 @@ function adjustmentLabel(value: number, lower: string, higher: string): string {
   return value < 0 ? lower : higher;
 }
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function progressLabel(progress: PiperInstallProgress): string {
+  if (!progress.totalBytes) return formatBytes(progress.receivedBytes);
+  return `${Math.min(100, Math.round((progress.receivedBytes / progress.totalBytes) * 100))}%`;
+}
+
 function TtsSettingsCard({ settings, onChange }: {
   settings: AppSettings;
   onChange: (changes: Partial<AppSettings>) => void;
 }) {
   const [previewing, setPreviewing] = useState(false);
   const [previewNotice, setPreviewNotice] = useState<string | null>(null);
+  const [piperStatus, setPiperStatus] = useState<PiperStatus | null>(null);
+  const [installProgress, setInstallProgress] = useState<PiperInstallProgress | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [installNotice, setInstallNotice] = useState<string | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => () => previewAudioRef.current?.pause(), []);
+
+  useEffect(() => {
+    let active = true;
+    getPiperStatus()
+      .then((status) => { if (active) setPiperStatus(status); })
+      .catch(() => {
+        // Vite's browser preview does not expose the Tauri IPC bridge.
+      });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let stopListening: (() => void) | undefined;
+    void listen<PiperInstallProgress>("nova:piper-progress", (event) => {
+      if (active) setInstallProgress(event.payload);
+    }).then((stop) => {
+      if (active) stopListening = stop;
+      else stop();
+    });
+    return () => { active = false; stopListening?.(); };
+  }, []);
+
+  async function installSelectedVoice() {
+    setInstalling(true);
+    setInstallNotice("正在下载离线语音…");
+    setInstallProgress(null);
+    try {
+      const status = await installPiperVoice(settings.ttsVoice);
+      setPiperStatus(status);
+      setInstallNotice("离线语音已就绪");
+    } catch (error) {
+      setInstallNotice(errorMessage(error));
+    } finally {
+      setInstalling(false);
+      setInstallProgress(null);
+    }
+  }
+
+  function selectProvider(provider: TtsProvider) {
+    if (provider === settings.ttsProvider) return;
+    if (provider === "piper") {
+      const known = piperStatus?.voices.some((voice) => voice.id === settings.ttsVoice) ?? false;
+      const fallback = piperStatus?.defaultVoice ?? "zh_CN-huayan-medium";
+      onChange({ ttsProvider: "piper", ttsVoice: known ? settings.ttsVoice : fallback });
+    } else {
+      const known = edgeVoiceOptions.some(([value]) => value === settings.ttsVoice);
+      onChange({ ttsProvider: "edge", ttsVoice: known ? settings.ttsVoice : edgeVoiceOptions[0][0] });
+    }
+  }
 
   function stopPreview() {
     previewAudioRef.current?.pause();
@@ -1221,7 +1292,7 @@ function TtsSettingsCard({ settings, onChange }: {
         rate: settings.ttsRate,
         pitch: settings.ttsPitch,
         volume: settings.ttsVolume,
-      });
+      }, settings.ttsProvider);
       const audio = new Audio(`data:${result.contentType};base64,${result.audioBase64}`);
       previewAudioRef.current = audio;
       audio.onended = () => {
@@ -1245,28 +1316,90 @@ function TtsSettingsCard({ settings, onChange }: {
     }
   }
 
+  const selectedVoice = piperStatus?.voices.find((voice) => voice.id === settings.ttsVoice) ?? null;
+  const piperReady = piperStatus?.supported === true && piperStatus.runtimeReady && selectedVoice?.installed === true;
+  const needsInstall = piperStatus !== null && piperStatus.supported && !piperReady;
+
   return (
     <section className="settings-card tts-card">
       <span className="section-tag">语音播放</span>
       <h2>声音</h2>
-      <label>
-        <span>声音</span>
-        <select value={settings.ttsVoice} onChange={(event) => onChange({ ttsVoice: event.target.value })}>
-          {edgeVoiceOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-        </select>
-      </label>
+      <div aria-label="语音方式" className="capability-tabs" role="group">
+        <button
+          className={settings.ttsProvider === "piper" ? "is-active" : ""}
+          disabled={piperStatus?.supported === false}
+          onClick={() => selectProvider("piper")}
+          type="button"
+        >
+          离线语音
+        </button>
+        <button
+          className={settings.ttsProvider === "edge" ? "is-active" : ""}
+          onClick={() => selectProvider("edge")}
+          type="button"
+        >
+          在线语音
+        </button>
+      </div>
+      {settings.ttsProvider === "piper" ? (
+        <>
+          <label>
+            <span>离线音色</span>
+            <select value={settings.ttsVoice} onChange={(event) => onChange({ ttsVoice: event.target.value })}>
+              {(piperStatus?.voices ?? []).map((voice) => (
+                <option key={voice.id} value={voice.id}>
+                  {voice.label}{voice.installed ? "（已下载）" : `（需下载 ${formatBytes(voice.downloadBytes)}）`}
+                </option>
+              ))}
+            </select>
+          </label>
+          {selectedVoice && <p className="tts-hint">{selectedVoice.note}；{selectedVoice.license}</p>}
+          {piperStatus?.supported === false && (
+            <p className="tts-hint" role="alert">当前系统暂不支持离线语音，请改用在线语音。</p>
+          )}
+          {piperStatus?.supported && (
+            <div className="tts-download">
+              <button
+                className="secondary-button"
+                disabled={installing || !needsInstall}
+                onClick={() => void installSelectedVoice()}
+                type="button"
+              >
+                {installing ? "下载中…" : piperReady ? "语音已就绪" : `下载语音包（${formatBytes(piperStatus.pendingBytes)}）`}
+              </button>
+              {installProgress && (
+                <span className="tts-hint">
+                  {installProgress.phase === "runtime" ? "正在下载语音引擎" : "正在下载音色"} · {progressLabel(installProgress)}
+                </span>
+              )}
+              {!installProgress && installNotice && <span className="tts-hint" role="alert">{installNotice}</span>}
+            </div>
+          )}
+        </>
+      ) : (
+        <label>
+          <span>在线音色</span>
+          <select value={settings.ttsVoice} onChange={(event) => onChange({ ttsVoice: event.target.value })}>
+            {edgeVoiceOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+        </label>
+      )}
       <div className="tts-control">
         <div className="tts-control__head"><strong>语速</strong><output>{adjustmentLabel(settings.ttsRate, "慢一点", "快一点")}</output></div>
         <input aria-label="语速" max={100} min={-50} onChange={(event) => onChange({ ttsRate: Number(event.target.value) })} step={5} type="range" value={settings.ttsRate} />
       </div>
-      <div className="tts-control">
-        <div className="tts-control__head"><strong>声调</strong><output>{adjustmentLabel(settings.ttsPitch, "低一点", "高一点")}</output></div>
-        <input aria-label="声调" max={50} min={-50} onChange={(event) => onChange({ ttsPitch: Number(event.target.value) })} step={5} type="range" value={settings.ttsPitch} />
-      </div>
-      <div className="tts-control">
-        <div className="tts-control__head"><strong>音量</strong><output>{adjustmentLabel(settings.ttsVolume, "小一点", "大一点")}</output></div>
-        <input aria-label="音量" max={50} min={-50} onChange={(event) => onChange({ ttsVolume: Number(event.target.value) })} step={5} type="range" value={settings.ttsVolume} />
-      </div>
+      {settings.ttsProvider === "edge" && (
+        <>
+          <div className="tts-control">
+            <div className="tts-control__head"><strong>声调</strong><output>{adjustmentLabel(settings.ttsPitch, "低一点", "高一点")}</output></div>
+            <input aria-label="声调" max={50} min={-50} onChange={(event) => onChange({ ttsPitch: Number(event.target.value) })} step={5} type="range" value={settings.ttsPitch} />
+          </div>
+          <div className="tts-control">
+            <div className="tts-control__head"><strong>音量</strong><output>{adjustmentLabel(settings.ttsVolume, "小一点", "大一点")}</output></div>
+            <input aria-label="音量" max={50} min={-50} onChange={(event) => onChange({ ttsVolume: Number(event.target.value) })} step={5} type="range" value={settings.ttsVolume} />
+          </div>
+        </>
+      )}
       <div className="tts-preview">
         <button className="secondary-button" onClick={() => previewing ? stopPreview() : void previewVoice()} type="button">
           {previewing ? "停止试听" : "试听一下"}

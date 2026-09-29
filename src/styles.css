@@ -290,6 +290,10 @@ nav { display: grid; gap: 7px; }
 .tts-control__head output { color: var(--accent); font-size: 11px; font-variant-numeric: tabular-nums; }
 .tts-preview { display: flex; align-items: center; gap: 10px; margin-top: 18px; padding-top: 15px; border-top: 1px solid rgba(91, 66, 70, 0.09); }
 .tts-preview span { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.tts-hint { margin: 8px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.tts-download { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+.tts-download .secondary-button { min-height: 36px; white-space: nowrap; }
+.tts-download .tts-hint { margin: 0; }
 
 .theme-picker { display: flex; gap: 10px; margin-bottom: 15px; }
 .theme-dot { width: 28px; height: 28px; border: 3px solid var(--surface); border-radius: 50%; cursor: pointer; box-shadow: 0 0 0 1px rgba(87, 66, 71, 0.15); }

@@ -11,6 +11,19 @@ use crate::error::AppError;
 
 const DATABASE_FILE_NAME: &str = "nova.db";
 
+/// Offline Piper is the default speech provider wherever a prebuilt runtime is available; other
+/// platforms keep the online Edge TTS voice until a Piper runtime exists for them.
+const DEFAULT_TTS_PROVIDER: &str = if crate::piper_tts::SUPPORTED {
+    "piper"
+} else {
+    "edge"
+};
+const DEFAULT_TTS_VOICE: &str = if crate::piper_tts::SUPPORTED {
+    crate::piper_tts::DEFAULT_VOICE
+} else {
+    crate::edge_tts::DEFAULT_VOICE
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PersonaProfile {
@@ -18,6 +31,10 @@ pub struct PersonaProfile {
     pub personality: String,
     #[serde(default, skip_serializing)]
     pub speech_style: String,
+}
+
+fn default_tts_provider() -> String {
+    DEFAULT_TTS_PROVIDER.to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,6 +46,9 @@ pub struct AppSettings {
     pub dnd_end: Option<String>,
     pub voice_autoplay: bool,
     pub proactive_enabled: bool,
+    /// `piper` (offline, default) or `edge` (online).
+    #[serde(default = "default_tts_provider")]
+    pub tts_provider: String,
     pub tts_voice: String,
     pub tts_rate: i32,
     pub tts_pitch: i32,
@@ -186,7 +206,7 @@ impl Database {
         self.connection()?
             .query_row(
                 "SELECT theme, dark_mode, dnd_start, dnd_end, voice_autoplay, proactive_enabled,
-                        tts_voice, tts_rate, tts_pitch, tts_volume
+                        tts_provider, tts_voice, tts_rate, tts_pitch, tts_volume
                  FROM app_settings WHERE id = 1",
                 [],
                 |row| {
@@ -197,10 +217,11 @@ impl Database {
                         dnd_end: row.get(3)?,
                         voice_autoplay: row.get::<_, i64>(4)? != 0,
                         proactive_enabled: row.get::<_, i64>(5)? != 0,
-                        tts_voice: row.get(6)?,
-                        tts_rate: row.get(7)?,
-                        tts_pitch: row.get(8)?,
-                        tts_volume: row.get(9)?,
+                        tts_provider: row.get(6)?,
+                        tts_voice: row.get(7)?,
+                        tts_rate: row.get(8)?,
+                        tts_pitch: row.get(9)?,
+                        tts_volume: row.get(10)?,
                     })
                 },
             )
@@ -217,10 +238,11 @@ impl Database {
                     dnd_end = ?4,
                     voice_autoplay = ?5,
                     proactive_enabled = ?6,
-                    tts_voice = ?7,
-                    tts_rate = ?8,
-                    tts_pitch = ?9,
-                    tts_volume = ?10
+                    tts_provider = ?7,
+                    tts_voice = ?8,
+                    tts_rate = ?9,
+                    tts_pitch = ?10,
+                    tts_volume = ?11
                  WHERE id = 1",
                 params![
                     settings.theme,
@@ -229,6 +251,7 @@ impl Database {
                     settings.dnd_end,
                     settings.voice_autoplay,
                     settings.proactive_enabled,
+                    settings.tts_provider,
                     settings.tts_voice,
                     settings.tts_rate,
                     settings.tts_pitch,
@@ -1017,6 +1040,38 @@ fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         })?;
     }
 
+    if current_version < 8 {
+        let transaction = connection.transaction().map_err(|error| {
+            AppError::database(format!("failed to start database migration 8: {error}"))
+        })?;
+        // Speech synthesis moves to the offline Piper engine, so any voice name stored for the
+        // online provider is replaced by the pinned offline voice. Edge TTS stays selectable and
+        // keeps its own voice list in the settings page.
+        transaction
+            .execute_batch(
+                "ALTER TABLE app_settings ADD COLUMN tts_provider TEXT NOT NULL DEFAULT 'piper';",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 8: {error}"))
+            })?;
+        transaction
+            .execute(
+                "UPDATE app_settings SET tts_provider = ?1, tts_voice = ?2 WHERE id = 1",
+                params![DEFAULT_TTS_PROVIDER, DEFAULT_TTS_VOICE],
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 8: {error}"))
+            })?;
+        transaction
+            .execute_batch("INSERT INTO schema_migrations (version) VALUES (8);")
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 8: {error}"))
+            })?;
+        transaction.commit().map_err(|error| {
+            AppError::database(format!("failed to commit database migration 8: {error}"))
+        })?;
+    }
+
     Ok(())
 }
 
@@ -1080,7 +1135,8 @@ mod tests {
             dnd_end: Some("08:00".to_owned()),
             voice_autoplay: false,
             proactive_enabled: false,
-            tts_voice: "zh-CN-XiaoxiaoNeural".to_owned(),
+            tts_provider: "piper".to_owned(),
+            tts_voice: "zh_CN-huayan-medium".to_owned(),
             tts_rate: -5,
             tts_pitch: 0,
             tts_volume: 0,
@@ -1118,7 +1174,8 @@ mod tests {
             dnd_end: Some("07:00".to_owned()),
             voice_autoplay: false,
             proactive_enabled: false,
-            tts_voice: "zh-CN-XiaoxiaoNeural".to_owned(),
+            tts_provider: "piper".to_owned(),
+            tts_voice: "zh_CN-huayan-medium".to_owned(),
             tts_rate: -5,
             tts_pitch: 0,
             tts_volume: 0,

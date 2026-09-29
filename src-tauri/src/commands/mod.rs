@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use reqwest::{
@@ -19,6 +22,7 @@ use crate::{
             ScheduleRecord, WindowState,
         },
     },
+    piper_tts,
     proactive,
     schedule_intent::{LocalDate, parse_schedule_intent},
 };
@@ -31,6 +35,9 @@ pub struct BootstrapResponse {
     database_ready: bool,
     window_mode: String,
 }
+
+/// Emitted while an offline voice pack is being downloaded.
+const PIPER_PROGRESS_EVENT: &str = "nova:piper-progress";
 
 #[tauri::command]
 pub fn bootstrap(database: State<'_, Database>) -> Result<BootstrapResponse, CommandError> {
@@ -134,18 +141,61 @@ pub fn save_settings(
         return Err(AppError::Configuration("不支持的主题色".to_owned()).into());
     }
     validate_time_range(&settings.dnd_start, &settings.dnd_end)?;
-    let tts = edge_tts::validate_options(edge_tts::TtsOptions {
-        voice: settings.tts_voice.clone(),
-        rate: settings.tts_rate,
-        pitch: settings.tts_pitch,
-        volume: settings.tts_volume,
-    })?;
-    settings.tts_voice = tts.voice;
-    settings.tts_rate = tts.rate;
-    settings.tts_pitch = tts.pitch;
-    settings.tts_volume = tts.volume;
+    let provider = SpeechProvider::parse(&settings.tts_provider)?;
+    settings.tts_provider = provider.as_str().to_owned();
+    match provider {
+        SpeechProvider::Piper => {
+            settings.tts_voice = piper_tts::validate_voice(&settings.tts_voice)?.id.to_owned();
+            piper_tts::validate_rate(settings.tts_rate)?;
+        }
+        SpeechProvider::Edge => {
+            let tts = edge_tts::validate_options(edge_tts::TtsOptions {
+                voice: settings.tts_voice.clone(),
+                rate: settings.tts_rate,
+                pitch: settings.tts_pitch,
+                volume: settings.tts_volume,
+            })?;
+            settings.tts_voice = tts.voice;
+            settings.tts_rate = tts.rate;
+            settings.tts_pitch = tts.pitch;
+            settings.tts_volume = tts.volume;
+        }
+    }
     database.save_settings(&settings)?;
     Ok(settings)
+}
+
+/// Speech synthesis can run offline through Piper or online through Edge TTS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpeechProvider {
+    Piper,
+    Edge,
+}
+
+impl SpeechProvider {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Piper => "piper",
+            Self::Edge => "edge",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, AppError> {
+        match value.trim() {
+            "piper" => Ok(Self::Piper),
+            "edge" => Ok(Self::Edge),
+            other => Err(AppError::Configuration(format!(
+                "不支持的语音合成方式「{other}」"
+            ))),
+        }
+    }
+}
+
+fn app_data_root(app: &AppHandle) -> Result<PathBuf, CommandError> {
+    app.path()
+        .app_data_dir()
+        .map_err(|error| AppError::internal(format!("无法定位应用数据目录：{error}")).into())
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -218,7 +268,7 @@ pub fn save_api_profile(
 ) -> Result<ApiProfileStatus, CommandError> {
     if matches!(profile.capability, ApiCapability::Speech) {
         return Err(AppError::Configuration(
-            "暂不支持自定义语音合成，请在 TTS 设置中配置 Edge TTS".to_owned(),
+            "暂不支持自定义语音合成，请在语音设置中选择离线 Piper 或在线 Edge 音色".to_owned(),
         )
         .into());
     }
@@ -263,7 +313,7 @@ pub async fn test_api_profile(
 ) -> Result<ApiTestResult, CommandError> {
     if matches!(capability, ApiCapability::Speech) {
         return Err(AppError::Configuration(
-            "暂不支持自定义语音合成，请在 TTS 设置中配置 Edge TTS".to_owned(),
+            "暂不支持自定义语音合成，请在语音设置中选择离线 Piper 或在线 Edge 音色".to_owned(),
         )
         .into());
     }
@@ -1020,32 +1070,90 @@ pub async fn transcribe_audio(
 
 #[tauri::command]
 pub async fn synthesize_speech(
+    app: AppHandle,
     database: State<'_, Database>,
     text: String,
     options: Option<edge_tts::TtsOptions>,
+    provider: Option<SpeechProvider>,
 ) -> Result<SpeechSynthesisResult, CommandError> {
     let input = required_text("要朗读的文本", text, 8_000)?;
-    let options = match options {
-        Some(options) => edge_tts::validate_options(options)?,
-        None => {
-            let settings = database.get_settings()?;
-            edge_tts::validate_options(edge_tts::TtsOptions {
-                voice: settings.tts_voice,
-                rate: settings.tts_rate,
-                pitch: settings.tts_pitch,
-                volume: settings.tts_volume,
-            })?
-        }
+    let settings = database.get_settings()?;
+    let provider = match provider {
+        Some(provider) => provider,
+        None => SpeechProvider::parse(&settings.tts_provider)?,
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        edge_tts::synthesize(&input, &options).map(|audio| SpeechSynthesisResult {
-            audio_base64: BASE64.encode(audio),
-            content_type: "audio/mpeg".to_owned(),
-        })
+    let voice = options
+        .as_ref()
+        .map_or_else(|| settings.tts_voice.clone(), |options| options.voice.clone());
+    let rate = options.as_ref().map_or(settings.tts_rate, |options| options.rate);
+
+    match provider {
+        SpeechProvider::Piper => {
+            let root = app_data_root(&app)?;
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                piper_tts::synthesize(&root, &input, &voice, rate).map(|audio| {
+                    SpeechSynthesisResult {
+                        audio_base64: BASE64.encode(audio),
+                        content_type: "audio/wav".to_owned(),
+                    }
+                })
+            })
+            .await
+            .map_err(|error| AppError::internal(format!("离线语音合成任务失败：{error}")))?;
+            result.map_err(Into::into)
+        }
+        SpeechProvider::Edge => {
+            let options = edge_tts::validate_options(edge_tts::TtsOptions {
+                voice,
+                rate,
+                pitch: options.as_ref().map_or(settings.tts_pitch, |options| options.pitch),
+                volume: options
+                    .as_ref()
+                    .map_or(settings.tts_volume, |options| options.volume),
+            })?;
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                edge_tts::synthesize(&input, &options).map(|audio| SpeechSynthesisResult {
+                    audio_base64: BASE64.encode(audio),
+                    content_type: "audio/mpeg".to_owned(),
+                })
+            })
+            .await
+            .map_err(|error| AppError::internal(format!("Edge TTS 任务失败：{error}")))?;
+            result.map_err(Into::into)
+        }
+    }
+}
+
+/// Reports which Piper runtime and offline voices are present on this machine.
+#[tauri::command]
+pub fn get_piper_status(
+    app: AppHandle,
+    database: State<'_, Database>,
+) -> Result<piper_tts::PiperStatus, CommandError> {
+    let root = app_data_root(&app)?;
+    let settings = database.get_settings()?;
+    Ok(piper_tts::status(&root, &settings.tts_voice))
+}
+
+/// Downloads the pinned Piper runtime and one voice pack, then reports the new state.
+#[tauri::command]
+pub async fn install_piper_voice(
+    app: AppHandle,
+    voice_id: String,
+) -> Result<piper_tts::PiperStatus, CommandError> {
+    let root = app_data_root(&app)?;
+    let progress_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        piper_tts::install(&root, &voice_id, &mut |progress| {
+            if let Err(error) = progress_app.emit(PIPER_PROGRESS_EVENT, progress) {
+                eprintln!("failed to report speech download progress: {error}");
+            }
+        })?;
+        Ok::<_, AppError>(piper_tts::status(&root, &voice_id))
     })
     .await
-    .map_err(|error| AppError::internal(format!("Edge TTS 任务失败：{error}")))?
-    .map_err(Into::into)
+    .map_err(|error| AppError::internal(format!("语音包下载任务失败：{error}")))?;
+    result.map_err(Into::into)
 }
 
 fn enabled_audio_profile(
