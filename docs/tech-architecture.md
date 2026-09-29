@@ -11,7 +11,7 @@
 - 聊天、记忆、日程、角色设定和应用设置仅保存于本机 SQLite 数据库；第一版不设置数据库密码，也不加密数据库文件。
 - API Key 可在设置页配置、修改和测试，但明文只能保存在操作系统凭据存储中。
 - 低频输入检测只产生空闲状态和持续时间，不采集键盘内容、鼠标位置或具体操作。
-- 对话和语音识别支持独立的 OpenAI 兼容 API 配置，且可复用同一 API Key；语音合成由 `tts_provider` 切换：默认 **Piper 离线中文语音（Windows x64）**，非 Windows 或未下载语音包时回退到 **Rust 实现的 Edge TTS 在线语音**。设置页提供语音方式、音色与语速；Piper 只有语速，因此 piper 模式隐藏声调/音量。
+- 对话和语音识别支持独立的 OpenAI 兼容 API 配置，且可复用同一 API Key；语音合成由 `tts_provider` 切换：默认 **Edge TTS 在线语音（免费、无需 Key）**，另可选 **火山引擎豆包语音（在线，需访问密钥）**。设置页先选语音方式，再配置该方式自己的音色与参数。
 - 第一版只要求开发环境直接运行，不产出安装包。
 
 ## 2. 交付形态与运行环境
@@ -24,7 +24,7 @@
 | macOS 运行环境 | macOS 13+、Apple Silicon 或 Intel、Xcode Command Line Tools |
 | 前端运行环境 | Node.js 24.14.0、npm 11.9.0 |
 | 本地启动方式 | `npm run tauri dev` |
-| 远端依赖 | 用户自行配置的对话/语音识别 OpenAI 兼容 API；Edge TTS 在线服务（仅在线语音时使用）。Piper 运行时与音色模型按需从 `rhasspy/piper` / HuggingFace 下载到本机后完全离线 |
+| 远端依赖 | 用户自行配置的对话/语音识别 OpenAI 兼容 API；Edge TTS 在线服务；可选火山引擎豆包语音网关（需访问密钥） |
 | 数据位置 | 应用数据目录中的明文 SQLite 数据库 |
 
 Windows 开发依赖 Microsoft C++ Build Tools 与 WebView2；macOS 开发需要 Xcode Command Line Tools。Tauri 官方前置条件说明了这些平台依赖。[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
@@ -95,7 +95,7 @@ React UI
 | memories | id、content、source_message_id、created_at、updated_at | 自动形成且可人工管理的长期记忆 |
 | schedules | id、title、scheduled_at、remind_at、source_message_id、status | 应用内日程及其提醒状态 |
 | proactive_events | id、message_id、idle_started_at、notified_at、opened_at | 主动陪伴消息与通知状态 |
-| app_settings | theme、dark_mode、dnd_start、dnd_end、voice_autoplay、tts_provider、tts_voice、tts_rate、tts_pitch、tts_volume、onboarding_required | 非敏感应用行为、语音合成设置（`tts_provider` 决定 Piper 离线 / Edge 在线）及保留的恢复引导状态 |
+| app_settings | theme、dark_mode、dnd_start、dnd_end、voice_autoplay、tts_provider、tts_voice、tts_rate、tts_pitch、tts_volume、volc_api_url、volc_model、volc_voice、volc_speed、onboarding_required | 非敏感应用行为、语音合成设置（`tts_provider` 为 `edge` / `volcengine`，两种方式的参数各自保留）及保留的恢复引导状态 |
 
 ### 本地存储与密钥策略
 
@@ -123,11 +123,12 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 | 本地命令 | bootstrap | MODULE-001、MODULE-008 | 读取窗口状态及数据清空后是否需要引导 |
 | 本地命令 | save_persona、get_persona | MODULE-001 | 管理虚拟女友设定 |
 | 本地命令 | send_message、transcribe_audio、synthesize_speech | MODULE-002 | 文字与语音交互 |
-| 本地命令 | get_piper_status、install_piper_voice | MODULE-002 | 查询/下载离线 Piper 运行时与中文音色 |
 | 本地命令 | list_memories、update_memory、delete_memory、export_data | MODULE-003、MODULE-006 | 管理与导出数据 |
 | 本地命令 | confirm_schedule、list_schedules、update_schedule、delete_schedule | MODULE-005 | 管理应用内日程 |
 | 本地命令 | save_api_profile、test_api_profile、get_api_profile_status | MODULE-008 | 配置、测试和读取脱敏 API 状态 |
 | 本地命令 | save_settings、get_settings | MODULE-004、MODULE-007 | 管理免打扰、主题、语音播放和语音方式/音色设置 |
+
+语音合成的火山引擎访问密钥不进入数据表：它由 MODULE-008 写入系统凭据存储（引用名 `tts-volcengine`），`get_settings` 只返回是否已保存。
 
 ### 远端 API 适配
 
@@ -135,7 +136,7 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 |---|---|---|
 | 对话 | `POST /chat/completions` | base URL、路径、模型、API Key 引用 |
 | 语音识别 | `POST /audio/transcriptions` | base URL、路径、模型、API Key 引用 |
-| 语音合成 | Piper 本机 sidecar（默认）或 Edge TTS WebSocket | piper：离线中文音色 + 语速，运行时/模型单独下载并校验 SHA-256；edge：音色、语速、音调、音量，无需 API Key |
+| 语音合成 | Edge TTS WebSocket（默认）或火山引擎豆包语音网关 | edge：音色、语速、音调、音量，无需 API Key；volcengine：OpenAI 兼容 `POST /v1/audio/speech`，Bearer 访问密钥，模型/音色/语速可配 |
 
 - 对话和语音识别各有配置资料，允许它们指向同一供应商或不同供应商；语音合成不创建自定义 API 配置。
 - 远端请求统一由 Rust 发送，并使用 `Authorization: Bearer <API Key>`。
@@ -160,11 +161,11 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 | ADR-004 | 远端 API 调用位置 | React 不应持有 API Key | Rust 服务层统一调用 | React 直连远端 API | 会暴露密钥并导致错误处理分散 |
 | ADR-005 | 主动陪伴输入检测 | 需要判断低频操作且保护隐私 | 仅采集空闲状态与持续时间 | 键盘监听内容；鼠标轨迹采集 | 超出需求且侵犯隐私 |
 | ADR-006 | 服务端与同步 | 第一版为单用户、本地使用 | 不建设服务端、账号与云同步 | 自建云端后端 | 超出当前范围并增加维护成本 |
-| ADR-007 | 语音与对话配置 | 对话和识别可能来自不同兼容服务；免费 TTS 需避免额外 Key且优先离线 | 对话/识别独立配置；TTS 由 `tts_provider` 切换：默认 Piper 离线（Windows x64），Edge 在线作为备选 | 自定义 OpenAI 兼容 TTS；随包分发 Piper 运行时 | 优先本地优先与低配置复杂度；运行时按需下载，Piper 无音调/音量 |
+| ADR-007 | 语音与对话配置 | 对话和识别可能来自不同兼容服务；TTS 需支持免费与高质量两种档位 | 对话/识别独立配置；TTS 由 `tts_provider` 切换：默认 Edge 在线（免费），可选火山引擎豆包语音（需 Key） | 自定义 OpenAI 兼容 TTS 配置页；本地离线 TTS | 先保底可用再追求音质；火山引擎访问密钥存系统凭据存储 |
 
 ## 9. 技术风险
 
-- OpenAI 兼容服务对聊天和语音识别端点的兼容程度不同；连接测试必须按能力分别执行。Edge TTS 依赖在线端点，可能受网络或服务端变更影响；Piper 无此风险，但首次下载需要能访问 GitHub/HuggingFace，且中文音色数据集许可不同（`huayan` 标注 Unknown）。
+- OpenAI 兼容服务对聊天和语音识别端点的兼容程度不同；连接测试必须按能力分别执行。Edge TTS 依赖在线端点，可能受网络或服务端变更影响；火山引擎豆包语音需要火山账号、访问密钥与相应服务开通，模型/音色 ID 由火山侧决定。
 - 明文 SQLite 数据库包含敏感对话信息；拥有本机文件访问权限的其他程序可能直接读取数据。
 - Windows/macOS 的空闲时长检测、通知权限和凭据存储 API 不同，应保持在 MODULE-007 与 MODULE-008 的平台适配边界内。
 - 外部 API 不可用会影响对话与语音能力；本地聊天、记忆、日程和设置必须仍可读取。
@@ -188,7 +189,7 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 ## 11. 人工确认结论
 
 - 用户已确认 Tauri + React + Rust 方案，且明确要求当前阶段不进行编码。
-- 用户已确认对话和语音识别采用可配置的 OpenAI 兼容 API；语音合成默认采用 Piper 离线中文语音（Windows x64），Edge TTS 作为在线备选，通过设置页配置语音方式、音色与语速。
+- 用户已确认对话和语音识别采用可配置的 OpenAI 兼容 API；语音合成默认采用免费的 Edge TTS，并可选火山引擎豆包语音；设置页先选语音方式，再配置该方式的音色与参数。
 - 用户已确认 API Key 继续由设置页配置；系统凭据存储负责保存密钥，Rust 服务层负责实际调用。
 - 用户已确认 Windows 10/11 x64 与 macOS 13+ Apple Silicon/Intel 支持范围。
 - 用户已确认第一版使用明文 SQLite，不设置数据库密码。

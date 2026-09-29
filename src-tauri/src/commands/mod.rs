@@ -1,7 +1,4 @@
-use std::{
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use reqwest::{
@@ -22,9 +19,9 @@ use crate::{
             ScheduleRecord, WindowState,
         },
     },
-    piper_tts,
     proactive,
     schedule_intent::{LocalDate, parse_schedule_intent},
+    volcengine_tts,
 };
 
 #[derive(Debug, Serialize)]
@@ -35,9 +32,6 @@ pub struct BootstrapResponse {
     database_ready: bool,
     window_mode: String,
 }
-
-/// Emitted while an offline voice pack is being downloaded.
-const PIPER_PROGRESS_EVENT: &str = "nova:piper-progress";
 
 #[tauri::command]
 pub fn bootstrap(database: State<'_, Database>) -> Result<BootstrapResponse, CommandError> {
@@ -128,7 +122,9 @@ pub fn save_persona(
 
 #[tauri::command]
 pub fn get_settings(database: State<'_, Database>) -> Result<AppSettings, CommandError> {
-    Ok(database.get_settings()?)
+    let mut settings = database.get_settings()?;
+    settings.volc_api_key_set = credentials::secret_exists(volcengine_tts::SECRET_REFERENCE)?;
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -143,11 +139,15 @@ pub fn save_settings(
     validate_time_range(&settings.dnd_start, &settings.dnd_end)?;
     let provider = SpeechProvider::parse(&settings.tts_provider)?;
     settings.tts_provider = provider.as_str().to_owned();
+
+    let existing_key = credentials::secret_exists(volcengine_tts::SECRET_REFERENCE)?;
+    let new_key = settings
+        .volc_api_key
+        .take()
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty());
+
     match provider {
-        SpeechProvider::Piper => {
-            settings.tts_voice = piper_tts::validate_voice(&settings.tts_voice)?.id.to_owned();
-            piper_tts::validate_rate(settings.tts_rate)?;
-        }
         SpeechProvider::Edge => {
             let tts = edge_tts::validate_options(edge_tts::TtsOptions {
                 voice: settings.tts_voice.clone(),
@@ -160,42 +160,58 @@ pub fn save_settings(
             settings.tts_pitch = tts.pitch;
             settings.tts_volume = tts.volume;
         }
+        SpeechProvider::Volcengine => {
+            let volc = volcengine_tts::validate_options(volcengine_tts::VolcOptions {
+                api_url: settings.volc_api_url.clone(),
+                model: settings.volc_model.clone(),
+                voice: settings.volc_voice.clone(),
+                speed: settings.volc_speed,
+            })?;
+            settings.volc_api_url = volc.api_url;
+            settings.volc_model = volc.model;
+            settings.volc_voice = volc.voice;
+            settings.volc_speed = volc.speed;
+            if new_key.is_none() && !existing_key {
+                return Err(AppError::Configuration(
+                    "请填写火山引擎访问密钥".to_owned(),
+                )
+                .into());
+            }
+        }
     }
     database.save_settings(&settings)?;
+    if let Some(key) = new_key {
+        credentials::set_secret(volcengine_tts::SECRET_REFERENCE, &key)?;
+    }
+    settings.volc_api_key_set = existing_key || credentials::secret_exists(volcengine_tts::SECRET_REFERENCE)?;
     Ok(settings)
 }
 
-/// Speech synthesis can run offline through Piper or online through Edge TTS.
+/// Speech synthesis is either the free online Edge voice or the Volcengine Doubao gateway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SpeechProvider {
-    Piper,
     Edge,
+    Volcengine,
 }
 
 impl SpeechProvider {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Piper => "piper",
             Self::Edge => "edge",
+            Self::Volcengine => "volcengine",
         }
     }
 
     fn parse(value: &str) -> Result<Self, AppError> {
         match value.trim() {
-            "piper" => Ok(Self::Piper),
             "edge" => Ok(Self::Edge),
+            "volcengine" => Ok(Self::Volcengine),
             other => Err(AppError::Configuration(format!(
                 "不支持的语音合成方式「{other}」"
             ))),
         }
     }
-}
-
-fn app_data_root(app: &AppHandle) -> Result<PathBuf, CommandError> {
-    app.path()
-        .app_data_dir()
-        .map_err(|error| AppError::internal(format!("无法定位应用数据目录：{error}")).into())
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -268,7 +284,7 @@ pub fn save_api_profile(
 ) -> Result<ApiProfileStatus, CommandError> {
     if matches!(profile.capability, ApiCapability::Speech) {
         return Err(AppError::Configuration(
-            "暂不支持自定义语音合成，请在语音设置中选择离线 Piper 或在线 Edge 音色".to_owned(),
+            "暂不支持自定义语音合成，请在语音设置中选择 Edge 或火山引擎音色".to_owned(),
         )
         .into());
     }
@@ -313,7 +329,7 @@ pub async fn test_api_profile(
 ) -> Result<ApiTestResult, CommandError> {
     if matches!(capability, ApiCapability::Speech) {
         return Err(AppError::Configuration(
-            "暂不支持自定义语音合成，请在语音设置中选择离线 Piper 或在线 Edge 音色".to_owned(),
+            "暂不支持自定义语音合成，请在语音设置中选择 Edge 或火山引擎音色".to_owned(),
         )
         .into());
     }
@@ -1040,6 +1056,22 @@ pub struct SpeechSynthesisResult {
     content_type: String,
 }
 
+/// Per-request overrides for speech synthesis. Every field is optional so a caller can rely on the
+/// saved settings; the settings page passes draft values so a preview reflects unsaved changes.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechOptions {
+    provider: Option<SpeechProvider>,
+    voice: Option<String>,
+    rate: Option<i32>,
+    pitch: Option<i32>,
+    volume: Option<i32>,
+    api_url: Option<String>,
+    model: Option<String>,
+    speed: Option<f64>,
+    api_key: Option<String>,
+}
+
 #[tauri::command]
 pub async fn transcribe_audio(
     database: State<'_, Database>,
@@ -1070,49 +1102,28 @@ pub async fn transcribe_audio(
 
 #[tauri::command]
 pub async fn synthesize_speech(
-    app: AppHandle,
     database: State<'_, Database>,
     text: String,
-    options: Option<edge_tts::TtsOptions>,
-    provider: Option<SpeechProvider>,
+    options: Option<SpeechOptions>,
 ) -> Result<SpeechSynthesisResult, CommandError> {
     let input = required_text("要朗读的文本", text, 8_000)?;
     let settings = database.get_settings()?;
-    let provider = match provider {
+    let options = options.unwrap_or_default();
+    let provider = match options.provider {
         Some(provider) => provider,
         None => SpeechProvider::parse(&settings.tts_provider)?,
     };
-    let voice = options
-        .as_ref()
-        .map_or_else(|| settings.tts_voice.clone(), |options| options.voice.clone());
-    let rate = options.as_ref().map_or(settings.tts_rate, |options| options.rate);
 
     match provider {
-        SpeechProvider::Piper => {
-            let root = app_data_root(&app)?;
-            let result = tauri::async_runtime::spawn_blocking(move || {
-                piper_tts::synthesize(&root, &input, &voice, rate).map(|audio| {
-                    SpeechSynthesisResult {
-                        audio_base64: BASE64.encode(audio),
-                        content_type: "audio/wav".to_owned(),
-                    }
-                })
-            })
-            .await
-            .map_err(|error| AppError::internal(format!("离线语音合成任务失败：{error}")))?;
-            result.map_err(Into::into)
-        }
         SpeechProvider::Edge => {
-            let options = edge_tts::validate_options(edge_tts::TtsOptions {
-                voice,
-                rate,
-                pitch: options.as_ref().map_or(settings.tts_pitch, |options| options.pitch),
-                volume: options
-                    .as_ref()
-                    .map_or(settings.tts_volume, |options| options.volume),
+            let tts = edge_tts::validate_options(edge_tts::TtsOptions {
+                voice: options.voice.unwrap_or_else(|| settings.tts_voice.clone()),
+                rate: options.rate.unwrap_or(settings.tts_rate),
+                pitch: options.pitch.unwrap_or(settings.tts_pitch),
+                volume: options.volume.unwrap_or(settings.tts_volume),
             })?;
             let result = tauri::async_runtime::spawn_blocking(move || {
-                edge_tts::synthesize(&input, &options).map(|audio| SpeechSynthesisResult {
+                edge_tts::synthesize(&input, &tts).map(|audio| SpeechSynthesisResult {
                     audio_base64: BASE64.encode(audio),
                     content_type: "audio/mpeg".to_owned(),
                 })
@@ -1121,39 +1132,34 @@ pub async fn synthesize_speech(
             .map_err(|error| AppError::internal(format!("Edge TTS 任务失败：{error}")))?;
             result.map_err(Into::into)
         }
+        SpeechProvider::Volcengine => {
+            let api_key = match options
+                .api_key
+                .map(|key| key.trim().to_owned())
+                .filter(|key| !key.is_empty())
+            {
+                Some(key) => key,
+                None => credentials::get_secret(volcengine_tts::SECRET_REFERENCE)?,
+            };
+            let volc = volcengine_tts::validate_options(volcengine_tts::VolcOptions {
+                api_url: options.api_url.unwrap_or_else(|| settings.volc_api_url.clone()),
+                model: options.model.unwrap_or_else(|| settings.volc_model.clone()),
+                voice: options.voice.unwrap_or_else(|| settings.volc_voice.clone()),
+                speed: options.speed.unwrap_or(settings.volc_speed),
+            })?;
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                volcengine_tts::synthesize(&input, &volc, &api_key).map(|audio| {
+                    SpeechSynthesisResult {
+                        audio_base64: BASE64.encode(audio.bytes),
+                        content_type: audio.content_type,
+                    }
+                })
+            })
+            .await
+            .map_err(|error| AppError::internal(format!("火山引擎语音合成任务失败：{error}")))?;
+            result.map_err(Into::into)
+        }
     }
-}
-
-/// Reports which Piper runtime and offline voices are present on this machine.
-#[tauri::command]
-pub fn get_piper_status(
-    app: AppHandle,
-    database: State<'_, Database>,
-) -> Result<piper_tts::PiperStatus, CommandError> {
-    let root = app_data_root(&app)?;
-    let settings = database.get_settings()?;
-    Ok(piper_tts::status(&root, &settings.tts_voice))
-}
-
-/// Downloads the pinned Piper runtime and one voice pack, then reports the new state.
-#[tauri::command]
-pub async fn install_piper_voice(
-    app: AppHandle,
-    voice_id: String,
-) -> Result<piper_tts::PiperStatus, CommandError> {
-    let root = app_data_root(&app)?;
-    let progress_app = app.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        piper_tts::install(&root, &voice_id, &mut |progress| {
-            if let Err(error) = progress_app.emit(PIPER_PROGRESS_EVENT, progress) {
-                eprintln!("failed to report speech download progress: {error}");
-            }
-        })?;
-        Ok::<_, AppError>(piper_tts::status(&root, &voice_id))
-    })
-    .await
-    .map_err(|error| AppError::internal(format!("语音包下载任务失败：{error}")))?;
-    result.map_err(Into::into)
 }
 
 fn enabled_audio_profile(

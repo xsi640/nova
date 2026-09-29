@@ -11,18 +11,9 @@ use crate::error::AppError;
 
 const DATABASE_FILE_NAME: &str = "nova.db";
 
-/// Offline Piper is the default speech provider wherever a prebuilt runtime is available; other
-/// platforms keep the online Edge TTS voice until a Piper runtime exists for them.
-const DEFAULT_TTS_PROVIDER: &str = if crate::piper_tts::SUPPORTED {
-    "piper"
-} else {
-    "edge"
-};
-const DEFAULT_TTS_VOICE: &str = if crate::piper_tts::SUPPORTED {
-    crate::piper_tts::DEFAULT_VOICE
-} else {
-    crate::edge_tts::DEFAULT_VOICE
-};
+/// Speech synthesis defaults to the free online Edge voice; the Volcengine gateway is opt-in.
+const DEFAULT_TTS_PROVIDER: &str = "edge";
+const DEFAULT_TTS_VOICE: &str = crate::edge_tts::DEFAULT_VOICE;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -37,7 +28,7 @@ fn default_tts_provider() -> String {
     DEFAULT_TTS_PROVIDER.to_owned()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
     pub theme: String,
@@ -46,13 +37,25 @@ pub struct AppSettings {
     pub dnd_end: Option<String>,
     pub voice_autoplay: bool,
     pub proactive_enabled: bool,
-    /// `piper` (offline, default) or `edge` (online).
+    /// `edge` (online, default) or `volcengine` (Doubao voices through the Volcengine gateway).
     #[serde(default = "default_tts_provider")]
     pub tts_provider: String,
+    // Edge voice options.
     pub tts_voice: String,
     pub tts_rate: i32,
     pub tts_pitch: i32,
     pub tts_volume: i32,
+    // Volcengine gateway options.
+    pub volc_api_url: String,
+    pub volc_model: String,
+    pub volc_voice: String,
+    pub volc_speed: f64,
+    /// Write-only secret; read back from the credential store instead of the database.
+    #[serde(default, skip_serializing)]
+    pub volc_api_key: Option<String>,
+    /// Whether a Volcengine access key is present in the credential store.
+    #[serde(default)]
+    pub volc_api_key_set: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,7 +209,8 @@ impl Database {
         self.connection()?
             .query_row(
                 "SELECT theme, dark_mode, dnd_start, dnd_end, voice_autoplay, proactive_enabled,
-                        tts_provider, tts_voice, tts_rate, tts_pitch, tts_volume
+                        tts_provider, tts_voice, tts_rate, tts_pitch, tts_volume,
+                        volc_api_url, volc_model, volc_voice, volc_speed
                  FROM app_settings WHERE id = 1",
                 [],
                 |row| {
@@ -222,6 +226,12 @@ impl Database {
                         tts_rate: row.get(8)?,
                         tts_pitch: row.get(9)?,
                         tts_volume: row.get(10)?,
+                        volc_api_url: row.get(11)?,
+                        volc_model: row.get(12)?,
+                        volc_voice: row.get(13)?,
+                        volc_speed: row.get(14)?,
+                        volc_api_key: None,
+                        volc_api_key_set: false,
                     })
                 },
             )
@@ -242,7 +252,11 @@ impl Database {
                     tts_voice = ?8,
                     tts_rate = ?9,
                     tts_pitch = ?10,
-                    tts_volume = ?11
+                    tts_volume = ?11,
+                    volc_api_url = ?12,
+                    volc_model = ?13,
+                    volc_voice = ?14,
+                    volc_speed = ?15
                  WHERE id = 1",
                 params![
                     settings.theme,
@@ -256,6 +270,10 @@ impl Database {
                     settings.tts_rate,
                     settings.tts_pitch,
                     settings.tts_volume,
+                    settings.volc_api_url,
+                    settings.volc_model,
+                    settings.volc_voice,
+                    settings.volc_speed,
                 ],
             )
             .map_err(|error| AppError::database(format!("failed to save settings: {error}")))?;
@@ -1044,12 +1062,10 @@ fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         let transaction = connection.transaction().map_err(|error| {
             AppError::database(format!("failed to start database migration 8: {error}"))
         })?;
-        // Speech synthesis moves to the offline Piper engine, so any voice name stored for the
-        // online provider is replaced by the pinned offline voice. Edge TTS stays selectable and
-        // keeps its own voice list in the settings page.
+        // Adds the speech provider switch and pins the free online Edge voice as the default.
         transaction
             .execute_batch(
-                "ALTER TABLE app_settings ADD COLUMN tts_provider TEXT NOT NULL DEFAULT 'piper';",
+                "ALTER TABLE app_settings ADD COLUMN tts_provider TEXT NOT NULL DEFAULT 'edge';",
             )
             .map_err(|error| {
                 AppError::database(format!("failed to apply database migration 8: {error}"))
@@ -1069,6 +1085,54 @@ fn migrate(connection: &mut Connection) -> Result<(), AppError> {
             })?;
         transaction.commit().map_err(|error| {
             AppError::database(format!("failed to commit database migration 8: {error}"))
+        })?;
+    }
+
+    if current_version < 9 {
+        let transaction = connection.transaction().map_err(|error| {
+            AppError::database(format!("failed to start database migration 9: {error}"))
+        })?;
+        // Volcengine (Doubao voices) joins Edge as a speech provider. The offline Piper provider
+        // is gone, so libraries that still point at `piper` fall back to the free Edge voice.
+        transaction
+            .execute_batch(
+                "ALTER TABLE app_settings ADD COLUMN volc_api_url TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE app_settings ADD COLUMN volc_model TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE app_settings ADD COLUMN volc_voice TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE app_settings ADD COLUMN volc_speed REAL NOT NULL DEFAULT 1.0;",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 9: {error}"))
+            })?;
+        transaction
+            .execute(
+                "UPDATE app_settings SET
+                    volc_api_url = ?1,
+                    volc_model = ?2,
+                    volc_voice = ?3,
+                    volc_speed = ?4,
+                    tts_provider = CASE WHEN tts_provider = 'piper' THEN ?5 ELSE tts_provider END,
+                    tts_voice = CASE WHEN tts_provider = 'piper' THEN ?6 ELSE tts_voice END
+                 WHERE id = 1",
+                params![
+                    crate::volcengine_tts::DEFAULT_API_URL,
+                    crate::volcengine_tts::DEFAULT_MODEL,
+                    crate::volcengine_tts::DEFAULT_VOICE,
+                    crate::volcengine_tts::DEFAULT_SPEED,
+                    DEFAULT_TTS_PROVIDER,
+                    DEFAULT_TTS_VOICE,
+                ],
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 9: {error}"))
+            })?;
+        transaction
+            .execute_batch("INSERT INTO schema_migrations (version) VALUES (9);")
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 9: {error}"))
+            })?;
+        transaction.commit().map_err(|error| {
+            AppError::database(format!("failed to commit database migration 9: {error}"))
         })?;
     }
 
@@ -1135,11 +1199,17 @@ mod tests {
             dnd_end: Some("08:00".to_owned()),
             voice_autoplay: false,
             proactive_enabled: false,
-            tts_provider: "piper".to_owned(),
-            tts_voice: "zh_CN-huayan-medium".to_owned(),
+            tts_provider: "edge".to_owned(),
+            tts_voice: "zh-CN-XiaoxiaoNeural".to_owned(),
             tts_rate: -5,
             tts_pitch: 0,
             tts_volume: 0,
+            volc_api_url: crate::volcengine_tts::DEFAULT_API_URL.to_owned(),
+            volc_model: crate::volcengine_tts::DEFAULT_MODEL.to_owned(),
+            volc_voice: crate::volcengine_tts::DEFAULT_VOICE.to_owned(),
+            volc_speed: crate::volcengine_tts::DEFAULT_SPEED,
+            volc_api_key: None,
+            volc_api_key_set: false,
         };
         database.save_settings(&settings).expect("save settings");
         assert_eq!(database.get_settings().expect("read settings"), settings);
@@ -1174,11 +1244,17 @@ mod tests {
             dnd_end: Some("07:00".to_owned()),
             voice_autoplay: false,
             proactive_enabled: false,
-            tts_provider: "piper".to_owned(),
-            tts_voice: "zh_CN-huayan-medium".to_owned(),
+            tts_provider: "edge".to_owned(),
+            tts_voice: "zh-CN-XiaoxiaoNeural".to_owned(),
             tts_rate: -5,
             tts_pitch: 0,
             tts_volume: 0,
+            volc_api_url: crate::volcengine_tts::DEFAULT_API_URL.to_owned(),
+            volc_model: crate::volcengine_tts::DEFAULT_MODEL.to_owned(),
+            volc_voice: crate::volcengine_tts::DEFAULT_VOICE.to_owned(),
+            volc_speed: crate::volcengine_tts::DEFAULT_SPEED,
+            volc_api_key: None,
+            volc_api_key_set: false,
         };
         database.save_settings(&settings).expect("save settings");
         let source = database

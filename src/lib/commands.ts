@@ -29,7 +29,7 @@ export interface PersonaProfile {
   personality: string;
 }
 
-export type TtsProvider = "piper" | "edge";
+export type TtsProvider = "edge" | "volcengine";
 
 export interface AppSettings {
   theme: "rose" | "lavender" | "mint" | "blue" | "peach";
@@ -39,44 +39,33 @@ export interface AppSettings {
   voiceAutoplay: boolean;
   proactiveEnabled: boolean;
   ttsProvider: TtsProvider;
+  // Edge voice options.
   ttsVoice: string;
   ttsRate: number;
   ttsPitch: number;
   ttsVolume: number;
+  // Volcengine gateway options.
+  volcApiUrl: string;
+  volcModel: string;
+  volcVoice: string;
+  volcSpeed: number;
+  /** Write-only access key; the backend stores it in the OS credential store. */
+  volcApiKey?: string | null;
+  /** Whether the backend already holds a Volcengine access key. */
+  volcApiKeySet: boolean;
 }
 
-export interface TtsOptions {
-  voice: string;
-  rate: number;
-  pitch: number;
-  volume: number;
-}
-
-export interface PiperVoiceStatus {
-  id: string;
-  label: string;
-  note: string;
-  license: string;
-  installed: boolean;
-  downloadBytes: number;
-}
-
-export interface PiperStatus {
-  supported: boolean;
-  runtimeReady: boolean;
-  runtimeVersion: string;
-  runtimeProvider: string;
-  runtimeUrl: string;
-  runtimeBytes: number;
-  defaultVoice: string;
-  voices: PiperVoiceStatus[];
-  pendingBytes: number;
-}
-
-export interface PiperInstallProgress {
-  phase: "runtime" | "voice";
-  receivedBytes: number;
-  totalBytes: number;
+/** Per-request speech overrides; omitted fields fall back to the saved settings. */
+export interface SpeechOptions {
+  provider?: TtsProvider;
+  voice?: string;
+  rate?: number;
+  pitch?: number;
+  volume?: number;
+  apiUrl?: string;
+  model?: string;
+  speed?: number;
+  apiKey?: string;
 }
 
 export type WindowMode = "compact" | "management";
@@ -253,18 +242,9 @@ export async function transcribeAudio(
 
 export async function synthesizeSpeech(
   text: string,
-  options?: TtsOptions,
-  provider?: TtsProvider,
+  options?: SpeechOptions,
 ): Promise<SpeechSynthesisResult> {
-  return invoke<SpeechSynthesisResult>("synthesize_speech", { text, options, provider });
-}
-
-export async function getPiperStatus(): Promise<PiperStatus> {
-  return invoke<PiperStatus>("get_piper_status");
-}
-
-export async function installPiperVoice(voiceId: string): Promise<PiperStatus> {
-  return invoke<PiperStatus>("install_piper_voice", { voiceId });
+  return invoke<SpeechSynthesisResult>("synthesize_speech", { text, options });
 }
 
 export async function listMemories(): Promise<MemoryRecord[]> {

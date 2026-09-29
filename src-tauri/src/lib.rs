@@ -3,11 +3,11 @@ mod edge_tts;
 pub mod error;
 pub mod export;
 mod infrastructure;
-mod piper_tts;
 pub mod proactive;
 pub mod reminders;
 pub mod schedule_intent;
 mod speech_text;
+mod volcengine_tts;
 
 use infrastructure::database::Database;
 use tauri::{Manager, WindowEvent, menu::MenuBuilder, tray::TrayIconBuilder};
@@ -126,8 +126,6 @@ pub fn run() {
             commands::mark_proactive_opened,
             commands::transcribe_audio,
             commands::synthesize_speech,
-            commands::get_piper_status,
-            commands::install_piper_voice,
             commands::set_window_mode,
             commands::open_chat_window,
             commands::open_settings_window,
