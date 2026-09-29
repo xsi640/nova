@@ -97,12 +97,6 @@ impl Default for VolcOptions {
     }
 }
 
-#[derive(Debug)]
-pub struct Synthesis {
-    pub bytes: Vec<u8>,
-    pub content_type: String,
-}
-
 pub fn validate_options(options: VolcOptions) -> Result<VolcOptions, AppError> {
     let resource_id = options.resource_id.trim().to_owned();
     if resource_id.is_empty() || resource_id.chars().count() > 64 {
@@ -141,11 +135,14 @@ pub fn validate_options(options: VolcOptions) -> Result<VolcOptions, AppError> {
     })
 }
 
-pub fn synthesize(
+/// Streams Doubao audio frames to `on_chunk` as they arrive, so playback can start before the
+/// whole utterance is synthesized.
+pub fn synthesize_stream(
     text: &str,
     options: &VolcOptions,
     api_key: &str,
-) -> Result<Synthesis, AppError> {
+    on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), AppError>,
+) -> Result<(), AppError> {
     let prepared = prepare_for_speech(text);
     if prepared.is_empty() {
         return Err(AppError::Audio("没有可供朗读的正文".to_owned()));
@@ -153,18 +150,9 @@ pub fn synthesize(
     let mut socket = VolcSocket::connect(options, api_key)?;
     socket.start_connection()?;
     socket.start_session()?;
-    let audio = socket.request_audio(&prepared)?;
+    let result = socket.request_audio(&prepared, on_chunk);
     socket.finish();
-    if audio.is_empty() {
-        return Err(AppError::Service("火山引擎未返回语音数据".to_owned()));
-    }
-    if audio.len() > MAX_AUDIO_BYTES {
-        return Err(AppError::Audio("语音音频超过 25 MB，无法播放".to_owned()));
-    }
-    Ok(Synthesis {
-        bytes: audio,
-        content_type: AUDIO_CONTENT_TYPE.to_owned(),
-    })
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -467,14 +455,16 @@ impl VolcSocket {
         }
     }
 
-    fn request_audio(&mut self, text: &str) -> Result<Vec<u8>, AppError> {
-        // `request_audio` needs the same speaker parameters as the session, so the caller rebuilds
-        // them from settings each time. The session payload is captured when the session starts.
+    fn request_audio(
+        &mut self,
+        text: &str,
+        on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), AppError>,
+    ) -> Result<(), AppError> {
         let payload = self.task_payload(text);
         self.send_event(EVENT_TASK_REQUEST, &payload)?;
         self.send_event(EVENT_FINISH_SESSION, b"{}")?;
 
-        let mut audio = Vec::new();
+        let mut total = 0usize;
         loop {
             let message = self.read_message()?;
             if message.message_type == MSG_ERROR_INFORMATION {
@@ -482,16 +472,22 @@ impl VolcSocket {
             }
             if message.message_type == MSG_AUDIO_ONLY_RESPONSE {
                 if !message.payload.is_empty() {
-                    audio.extend_from_slice(&message.payload);
-                    if audio.len() > MAX_AUDIO_BYTES {
+                    total = total.saturating_add(message.payload.len());
+                    if total > MAX_AUDIO_BYTES {
                         return Err(AppError::Audio("语音音频超过 25 MB，无法播放".to_owned()));
                     }
+                    on_chunk(&message.payload)?;
                 }
                 continue;
             }
             if message.message_type == MSG_FULL_SERVER_RESPONSE {
                 match message.event {
-                    EVENT_TTS_ENDED | EVENT_SESSION_FINISHED => return Ok(audio),
+                    EVENT_TTS_ENDED | EVENT_SESSION_FINISHED => {
+                        if total == 0 {
+                            return Err(AppError::Service("火山引擎未返回语音数据".to_owned()));
+                        }
+                        return Ok(());
+                    }
                     EVENT_SESSION_FAILED => return Err(self.failure(&message, "语音合成失败")),
                     EVENT_TTS_RESPONSE => {}
                     _ => {}

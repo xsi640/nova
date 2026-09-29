@@ -91,35 +91,41 @@ pub fn validate_options(options: TtsOptions) -> Result<TtsOptions, AppError> {
     Ok(TtsOptions { voice, ..options })
 }
 
-pub fn synthesize(text: &str, options: &TtsOptions) -> Result<Vec<u8>, AppError> {
+/// Streams Edge TTS audio frames to `on_chunk` as they arrive, so playback can start before the
+/// whole utterance is synthesized.
+pub fn synthesize_stream(
+    text: &str,
+    options: &TtsOptions,
+    on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), AppError>,
+) -> Result<(), AppError> {
     let options = validate_options(options.clone())?;
     let prepared = prepare_for_speech(text);
     if prepared.is_empty() {
         return Err(AppError::Audio("没有可供朗读的正文".to_owned()));
     }
-    let mut audio = Vec::new();
+    let mut total = 0usize;
     for chunk in split_text(&prepared) {
-        let chunk_audio = synthesize_chunk(&chunk, &options)?;
-        if audio.len().saturating_add(chunk_audio.len()) > MAX_AUDIO_BYTES {
-            return Err(AppError::Audio(
-                "Edge TTS 音频超过 25 MB，无法播放".to_owned(),
-            ));
-        }
-        audio.extend_from_slice(&chunk_audio);
+        synthesize_chunk(&chunk, &options, on_chunk, &mut total)?;
     }
-    if audio.is_empty() {
-        return Err(AppError::Audio("Edge TTS 返回了空音频".to_owned()));
+    if total == 0 {
+        return Err(AppError::Audio(
+            "Edge TTS 未返回音频，请检查网络或稍后重试".to_owned(),
+        ));
     }
-    Ok(audio)
+    Ok(())
 }
 
-fn synthesize_chunk(text: &str, options: &TtsOptions) -> Result<Vec<u8>, AppError> {
+fn synthesize_chunk(
+    text: &str,
+    options: &TtsOptions,
+    on_chunk: &mut dyn FnMut(&[u8]) -> Result<(), AppError>,
+    total: &mut usize,
+) -> Result<(), AppError> {
     let mut socket = connect()?;
     let timestamp = edge_timestamp()?;
     socket.send_text(&speech_config(&timestamp))?;
     socket.send_text(&ssml_request(&timestamp, text, options))?;
 
-    let mut audio = Vec::new();
     loop {
         match socket.read_frame()? {
             WebSocketFrame::Text(message) => {
@@ -146,12 +152,14 @@ fn synthesize_chunk(text: &str, options: &TtsOptions) -> Result<Vec<u8>, AppErro
                     .windows(b"Path:audio".len())
                     .any(|window| window == b"Path:audio")
                 {
-                    audio.extend_from_slice(&message[audio_start..]);
-                    if audio.len() > MAX_AUDIO_BYTES {
+                    let audio = &message[audio_start..];
+                    *total = total.saturating_add(audio.len());
+                    if *total > MAX_AUDIO_BYTES {
                         return Err(AppError::Audio(
                             "Edge TTS 音频超过 25 MB，无法播放".to_owned(),
                         ));
                     }
+                    on_chunk(audio)?;
                 }
             }
             WebSocketFrame::Ping(payload) => socket.send_control(0xA, &payload)?,
@@ -159,12 +167,7 @@ fn synthesize_chunk(text: &str, options: &TtsOptions) -> Result<Vec<u8>, AppErro
             WebSocketFrame::Pong => {}
         }
     }
-    if audio.is_empty() {
-        return Err(AppError::Audio(
-            "Edge TTS 未返回音频，请检查网络或稍后重试".to_owned(),
-        ));
-    }
-    Ok(audio)
+    Ok(())
 }
 
 fn connect() -> Result<EdgeWebSocket, AppError> {
@@ -563,8 +566,12 @@ mod tests {
     #[test]
     #[ignore = "uses the Edge TTS online service"]
     fn synthesizes_a_short_mp3_via_the_rust_websocket_client() {
-        let audio = super::synthesize("Nova 语音服务测试。", &TtsOptions::default())
-            .expect("Edge TTS returns audio");
+        let mut audio = Vec::new();
+        super::synthesize_stream("Nova 语音服务测试。", &TtsOptions::default(), &mut |chunk| {
+            audio.extend_from_slice(chunk);
+            Ok(())
+        })
+        .expect("Edge TTS returns audio");
         assert!(audio.len() > 1_000);
         assert!(
             audio.starts_with(b"ID3")

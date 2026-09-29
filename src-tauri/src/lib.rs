@@ -125,7 +125,7 @@ pub fn run() {
             commands::pending_proactive_message,
             commands::mark_proactive_opened,
             commands::transcribe_audio,
-            commands::synthesize_speech,
+            commands::synthesize_speech_stream,
             commands::set_window_mode,
             commands::open_chat_window,
             commands::open_settings_window,

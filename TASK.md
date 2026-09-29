@@ -1,66 +1,68 @@
-# TASK.md · TTS「先选方式再配置」（Edge / 火山引擎 v3 WebSocket）交接说明
+# TASK.md · TTS（Edge / 火山引擎 v3 WebSocket）流式播放交接说明
 
 > 更新时间：2026-09-29
 > 仓库：`D:/develop/github/xsi640/nova`（分支 `main`）
 
 ## 1. 需求
 
-- **去掉 Piper**（离线方案音质不达标，已整体移除）。
-- TTS **先选方式（Edge / 火山引擎），再配置该方式的参数**。
-- 火山引擎使用 **WebSocket TTS 协议**；**模型版本默认 `seed-tts-2.0-standard`**；**音色可选，默认小何 2.0**。
+- 去掉 Piper（离线音质不达标，已移除）。
+- TTS 先选方式（Edge / 火山引擎），再配置该方式的参数。
+- 火山引擎用 WebSocket 协议；模型版本默认 `seed-tts-2.0-standard`；音色可选，默认小何 2.0。
+- 火山鉴权用新控制台的单个 API Key（`X-Api-Key`）。
+- **合成与播放改成真流式**（边收边播），并清理无用代码。
 
 ## 2. 已完成
 
 ### 2.1 后端
 
-- **移除 Piper**：删除 `src-tauri/src/piper_tts.rs`、`mod piper_tts`、命令 `get_piper_status` / `install_piper_voice`、`nova:piper-progress` 事件、`app_data_root`，以及 `Cargo.toml` 的 `zip`（`tempfile` 退回 dev-dependencies）。`speech_text.rs` 保留，Edge/火山共用文本清洗。
-- **重写 `src-tauri/src/volcengine_tts.rs`：原生 v3 双向流式 WebSocket**
-  - 端点 `wss://openspeech.bytedance.com/api/v3/tts/bidirection`；资源 ID 默认 `seed-tts-2.0`；模型默认 `seed-tts-2.0-standard`（可选 `seed-tts-2.0-expressive`）；音色默认 `zh_female_xiaohe_uranus_bigtts`（小何 2.0）；输出 MP3。
-  - 自实现握手 + 二进制帧（`native-tls` + 掩码帧），协议事件序列 `StartConnection → StartSession → TaskRequest → FinishSession → FinishConnection`；`req_params` 含 `speaker`/`model`/`audio_params{format,sample_rate,speech_rate,loudness_rate}`，`namespace=BidirectionalTTS`。
-  - 单测：默认值校验、非法参数、UUID 形状、marshal/parse 往返，共 5 个。
-- **`commands/mod.rs`**：`SpeechProvider { Edge, Volcengine }`；`save_settings` 按方式校验；`get_settings` 回填 `volc_api_key_set`；`synthesize_speech(database, text, options?)`，`SpeechOptions` 全可选（provider/voice/rate/pitch/volume/resourceId/model/speechRate/loudnessRate/apiKey），未提供时回退已保存设置。
-- **密钥**：火山 **API Key** 存系统凭据存储（引用名 `tts-volcengine`），**不进数据库**。
-- **`infrastructure/database.rs`**：`AppSettings` 的火山字段为 `volc_resource_id`/`volc_model`/`volc_voice`/`volc_speech_rate`/`volc_loudness_rate` + `volc_api_key`(write-only) + `volc_api_key_set`(只读)。`DEFAULT_TTS_PROVIDER="edge"`。迁移 9（网关时代，已废弃的 `volc_api_url`/`volc_speed` 列保留但不读取）+ **迁移 10**（新增本协议的列并把 `volc_model`/`volc_voice` 设为新默认）。
+- **两个 provider 都提供 `synthesize_stream`**：
+  - `edge_tts::synthesize_stream`：每个 `Path:audio` 帧到达即回调；`synthesize` 包装已删除。
+  - `volcengine_tts::synthesize_stream`：`request_audio` 每收到一个 `AudioOnlyResponse` 帧即回调；`Synthesis`/`synthesize` 已删除。
+- **新命令 `synthesize_speech_stream(database, text, options?, on_event: Channel<TtsStreamEvent>)`**：先发 `Start { content_type }`，再逐个发 `Chunk { data }`（base64），错误通过命令的 `Result` 返回。旧的非流式 `synthesize_speech` / `SpeechSynthesisResult` 已删除。
+- **火山 v3 协议**：`wss://openspeech.bytedance.com/api/v3/tts/bidirection`，资源 `seed-tts-2.0`，`req_params.model` 默认 `seed-tts-2.0-standard`，默认音色 `zh_female_xiaohe_uranus_bigtts`，MP3；鉴权头 `X-Api-Key` + `X-Api-Resource-Id`/`X-Api-Request-Id`/`X-Api-Connect-Id`。API Key 存系统凭据存储（引用名 `tts-volcengine`），不入库。
+- **数据模型**：`AppSettings` 火山字段 `volc_resource_id`/`volc_model`/`volc_voice`/`volc_speech_rate`/`volc_loudness_rate` + `volc_api_key`(write-only) + `volc_api_key_set`(只读)。迁移 10 加入协议字段；**迁移 11 删除已废弃的 `volc_api_url`/`volc_speed`/`volc_app_id` 列**（SQLite 3.43 支持 `DROP COLUMN`）。
 
 ### 2.2 前端
 
-- `src/lib/commands.ts`：`TtsProvider = "edge" | "volcengine"`；`AppSettings`/`SpeechOptions` 同步新字段；`synthesizeSpeech(text, options?)`。
-- `src/App.tsx`：默认 `edge`；`TtsSettingsCard` 方式切换——Edge：音色/语速/声调/音量；火山：API Key / 模型版本（标准/表现力）/ 音色（带 2.0 建议，默认小何 2.0）/ 语速 / 音量；试听传对应 `SpeechOptions`。
+- `src/lib/commands.ts`：`SpeechStreamEvent` + `synthesizeSpeechStream(text, options, onEvent)`（用 `@tauri-apps/api/core` 的 `Channel`）；删除 `synthesizeSpeech` / `SpeechSynthesisResult`。
+- 新增 `src/lib/speechPlayer.ts`：`playStreamingSpeech(text, options)` 用 MediaSource（`audio/mpeg`）边收边播，返回 `{ stop(), done }`。
+- `src/App.tsx`：`ChatPage.playSpeech` 与设置页试听都改用 `playStreamingSpeech`；删除了按句切分（`splitSpeechSegments`）、整段缓存、`<audio data:...>` 播放与 `speechCacheRef`。
 
 ### 2.3 验证
 
 | 检查 | 结果 |
 | --- | --- |
-| `npm run typecheck` | ✅ |
-| `npm run check:rust` | ✅ 0 warning |
+| `npm run typecheck` / `npm run check:rust` | ✅ / ✅ 0 warning |
 | `npm run test:rust` | ✅ 60 passed / 0 failed / 1 ignored |
-| 真实数据库 | ✅ 迁移到 v10；`tts_provider=edge`，`volc_resource_id=seed-tts-2.0`，`volc_model=seed-tts-2.0-standard`，`volc_voice=zh_female_xiaohe_uranus_bigtts` |
-| 端点/鉴权头实测 | ✅ 对 `wss://openspeech.bytedance.com/api/v3/tts/bidirection` 发真实握手（假凭证）返回 `401`，证明 URL 与 `X-Api-*` 头被识别 |
-| `tauri dev` 启动 | ✅ 新构建运行 |
+| Edge 流式合成（真实联网，`--ignored` 测试） | ✅ |
+| MP3 分块入 MSE 播放（无头 Chrome） | ✅ `duration=Infinity`、播放推进到结束、无 error |
+| 真实数据库 | ✅ 迁移到 v11，火山默认值正确，死列已删除 |
+| 端点/鉴权头实测 | ✅ 假 Key 返回 `401 {"error":"Invalid X-Api-Key"}` |
+| `tauri dev` | ✅ 新构建运行 |
+
+### 2.4 附带修复：Windows 弹出 `ms-gamingoverlay`
+
+根因：本机未安装 Xbox Game Bar，且 **Game DVR 自动游戏检测**处于开启状态，任何 GPU/D3D 应用（WebView2 等）都会被当作游戏去激活 Game Bar，Game Bar 缺失就弹「需要新的应用来打开此 ms-gamingoverlay 链接」。仅禁用 Chromium 的 `EnableWindowsGamingInputDataFetcher` **不足以**解决（那只覆盖手柄输入路径）。
+
+已在该用户下关闭 Game DVR（HKCU，可回滚）：
+```
+HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR : AppCaptureEnabled=0, HistoricalCaptureEnabled=0
+HKCU\System\GameConfigStore : GameDVR_Enabled=0
+HKCU\SOFTWARE\Microsoft\GameBar : AutoGameModeEnabled=0, ShowStartupPanel=0, UseNexusForGameBarEnabled=0
+```
+`tauri.conf.json` 仍保留 `additionalBrowserArgs`（含 `EnableWindowsGamingInputDataFetcher`），作为手柄路径的额外保险。
 
 ## 3. 尚未完成 / 待确认
 
-1. **UI 人工走查**：两种方式的试听、聊天朗读与自动播放未由本人点击验证。
-2. **未用真实凭证做联网合成**（本机没有火山 API Key）。
-3. **首帧延时（TASK-016）**：目前后端是「一次性接收整段 MP3 再返回」，未把 WebSocket 音频流边收边推给前端；如需更低延迟，可后续做成流式回传。
-4. 遗留 `%APPDATA%\app.nova.companion\piper\`（旧 Piper 运行时/音色）可删。
+1. **UI 人工走查**：流式播放（试听、聊天朗读、自动播放、中途停止）未由本人点击验证。
+2. **未用真实火山凭证做联网合成**（本机没有 API Key）。
+3. **首帧延时量测**：TASK-016 需要按固定文本记录优化前后对比后才能标记完成。
+4. Edge 仍是每个 4096 字节分片新建一次 WebSocket 连接；如需再降延迟可复用单条连接。
+5. 遗留 `%APPDATA%\app.nova.companion\piper\`（旧 Piper 运行时/音色）可删。
 
-### 2.4 附带修复：Windows 弹出 `ms-gamingoverlay` 提示
+## 4. 关键实现细节
 
-现象：使用应用时 Windows 反复弹“需要新的应用来打开此 ms-gamingoverlay 链接”。
-
-原因：本机未安装 Xbox Game Bar，而 WebView2 运行时 120 默认启用 Chromium 的 `EnableWindowsGamingInputDataFetcher`（内部调用 `Windows.Gaming.Input`），会被 Windows 当作游戏而激活 Game Bar，Game Bar 缺失就变成这个弹窗。
-
-修复：`src-tauri/tauri.conf.json` 两个窗口都加 `additionalBrowserArgs`（必须带上 wry 默认项）：
-`--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,EnableWindowsGamingInputDataFetcher,WindowsGamingInputDataFetcher`
-已实测 nova 的 `msedgewebview2.exe` 进程带上了该参数。若仍弹出，可在系统层关闭 Game DVR / 重装 Game Bar。
-
-## 4. 使用方式
-
-设置页 → 语音播放 → 选「火山引擎」→ 填火山「语音技术」控制台的 **API Key** → 选音色（默认小何 2.0）→ 试听 → 保存。资源 ID 默认 `seed-tts-2.0`。
-
-## 5. 关键实现细节
-
-- v3 协议帧：4 字节头（`0x11 0x14 0x10 0x00` 表示 version1/JSON/无压缩/WithEvent）+ event(4) + [sessionId 长度+内容] + payload 长度 + payload；服务端音频帧类型 `0b1011`（AudioOnlyResponse），结束事件 `TTSEnded(359)` 或 `SessionFinished(152)`。
-- 鉴权：新控制台用单个 **API Key**，请求头发 `X-Api-Key`；另发 `X-Api-Resource-Id`/`X-Api-Request-Id`/`X-Api-Connect-Id`。实测假 Key 返回 `401 {"error":"Invalid X-Api-Key"}`。
-- 客户端为直连（不走代理），因为火山域名在国内可直连；`reqwest` 的代理环境变量不影响本模块。
+- v3 帧：4 字节头（`0x11 0x14 0x10 0x00`）+ event(4) + [sessionId 长度+内容] + payload 长度 + payload；音频帧类型 `0b1011`，结束事件 `TTSEnded(359)` 或 `SessionFinished(152)`。
+- Tauri Channel 用 JSON + base64 传音频块；`Channel<InvokeResponseBody>` 的 Raw 变体也可用，但当前选 base64 以保留类型化事件。
+- 前端 MSE：`MediaSource` + `addSourceBuffer('audio/mpeg')` + `mode="sequence"`；Chromium/WebView2 支持 `audio/mpeg`（已实测 `MediaSource.isTypeSupported('audio/mpeg') === true`）。
+- 停止播放：`playStreamingSpeech.stop()` 暂停并 resolve；后端流式请求无法中断，会在后台跑完（前端忽略后续块）。

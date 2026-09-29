@@ -6,7 +6,7 @@ use reqwest::{
     blocking::multipart::{Form, Part},
 };
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewWindow, ipc::Channel};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::{
@@ -1050,13 +1050,15 @@ struct TranscriptionResponse {
     text: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SpeechSynthesisResult {
-    /// Base64 keeps the binary payload inside Tauri's typed command boundary. It is intended for
-    /// an in-memory browser `Audio` object and is never persisted to the chat database.
-    audio_base64: String,
-    content_type: String,
+/// Events streamed back to the frontend while an utterance is synthesized, so playback can begin
+/// before the whole audio payload is ready.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum TtsStreamEvent {
+    /// Sent once before the first chunk so the player knows the audio container.
+    Start { content_type: String },
+    /// One base64-encoded audio chunk.
+    Chunk { data: String },
 }
 
 /// Per-request overrides for speech synthesis. Every field is optional so a caller can rely on the
@@ -1105,11 +1107,12 @@ pub async fn transcribe_audio(
 }
 
 #[tauri::command]
-pub async fn synthesize_speech(
+pub async fn synthesize_speech_stream(
     database: State<'_, Database>,
     text: String,
     options: Option<SpeechOptions>,
-) -> Result<SpeechSynthesisResult, CommandError> {
+    on_event: Channel<TtsStreamEvent>,
+) -> Result<(), CommandError> {
     let input = required_text("要朗读的文本", text, 8_000)?;
     let settings = database.get_settings()?;
     let options = options.unwrap_or_default();
@@ -1127,10 +1130,8 @@ pub async fn synthesize_speech(
                 volume: options.volume.unwrap_or(settings.tts_volume),
             })?;
             let result = tauri::async_runtime::spawn_blocking(move || {
-                edge_tts::synthesize(&input, &tts).map(|audio| SpeechSynthesisResult {
-                    audio_base64: BASE64.encode(audio),
-                    content_type: "audio/mpeg".to_owned(),
-                })
+                send_start(&on_event, "audio/mpeg")?;
+                edge_tts::synthesize_stream(&input, &tts, &mut |chunk| send_chunk(&on_event, chunk))
             })
             .await
             .map_err(|error| AppError::internal(format!("Edge TTS 任务失败：{error}")))?;
@@ -1155,11 +1156,9 @@ pub async fn synthesize_speech(
                 loudness_rate: options.loudness_rate.unwrap_or(settings.volc_loudness_rate),
             })?;
             let result = tauri::async_runtime::spawn_blocking(move || {
-                volcengine_tts::synthesize(&input, &volc, &api_key).map(|audio| {
-                    SpeechSynthesisResult {
-                        audio_base64: BASE64.encode(audio.bytes),
-                        content_type: audio.content_type,
-                    }
+                send_start(&on_event, volcengine_tts::AUDIO_CONTENT_TYPE)?;
+                volcengine_tts::synthesize_stream(&input, &volc, &api_key, &mut |chunk| {
+                    send_chunk(&on_event, chunk)
                 })
             })
             .await
@@ -1167,6 +1166,22 @@ pub async fn synthesize_speech(
             result.map_err(Into::into)
         }
     }
+}
+
+fn send_start(channel: &Channel<TtsStreamEvent>, content_type: &str) -> Result<(), AppError> {
+    channel
+        .send(TtsStreamEvent::Start {
+            content_type: content_type.to_owned(),
+        })
+        .map_err(|error| AppError::internal(format!("发送语音数据失败：{error}")))
+}
+
+fn send_chunk(channel: &Channel<TtsStreamEvent>, chunk: &[u8]) -> Result<(), AppError> {
+    channel
+        .send(TtsStreamEvent::Chunk {
+            data: BASE64.encode(chunk),
+        })
+        .map_err(|error| AppError::internal(format!("发送语音数据失败：{error}")))
 }
 
 fn enabled_audio_profile(

@@ -30,7 +30,6 @@ import {
   saveSettings,
   sendMessage,
   showNotification,
-  synthesizeSpeech,
   testApiProfile,
   transcribeAudio,
   type ApiCapability,
@@ -48,10 +47,10 @@ import {
   type ScheduleCandidate,
   type ScheduleStatus,
   type SpeechOptions,
-  type SpeechSynthesisResult,
   updateMemory,
   updateSchedule,
 } from "./lib/commands";
+import { playStreamingSpeech, type StreamingSpeech } from "./lib/speechPlayer";
 
 type Page = "memory" | "schedule" | "settings";
 
@@ -215,77 +214,6 @@ function errorMessage(error: unknown): string {
     return String(error.message);
   }
   return "保存失败，请稍后重试";
-}
-
-const SPEECH_SENTENCE_ENDERS = "。！？!?；;\n";
-const SPEECH_MIN_SEGMENT_LENGTH = 40;
-const SPEECH_MAX_SEGMENT_LENGTH = 180;
-const SPEECH_MAX_SEGMENTS = 20;
-
-function splitSpeechSegments(text: string): string[] {
-  const fragments: string[] = [];
-  let current = "";
-  for (const char of text.trim()) {
-    current += char;
-    if (SPEECH_SENTENCE_ENDERS.includes(char)) {
-      fragments.push(current);
-      current = "";
-    }
-  }
-  if (current) fragments.push(current);
-
-  // Fragments below the minimum length are carried forward into the next sentence so each
-  // synthesis request is worth the round trip. Raw fragments are kept so spacing between
-  // merged sentences survives; every segment is trimmed once at the end.
-  const merged: string[] = [];
-  let pending = "";
-  for (const fragment of fragments) {
-    if (!fragment.trim()) continue;
-    pending += fragment;
-    if (pending.length >= SPEECH_MIN_SEGMENT_LENGTH) {
-      merged.push(pending);
-      pending = "";
-    }
-  }
-  if (pending) {
-    const last = merged.at(-1);
-    if (last === undefined) merged.push(pending);
-    else merged[merged.length - 1] = last + pending;
-  }
-
-  const segments = merged.flatMap((piece) => piece.length > SPEECH_MAX_SEGMENT_LENGTH ? splitLongSpeechSegment(piece) : [piece]);
-  const trimmed = segments.map((segment) => segment.trim()).filter(Boolean);
-  if (trimmed.length <= SPEECH_MAX_SEGMENTS) return trimmed;
-  // Re-split the overflow into bounded pieces instead of folding it into one segment, which
-  // could exceed the backend's per-request character limit.
-  return [...trimmed.slice(0, SPEECH_MAX_SEGMENTS - 1), ...splitLongSpeechSegment(trimmed.slice(SPEECH_MAX_SEGMENTS - 1).join(""))];
-}
-
-function splitLongSpeechSegment(segment: string): string[] {
-  const parts: string[] = [];
-  let rest = segment;
-  while (rest.length > SPEECH_MAX_SEGMENT_LENGTH) {
-    const window = rest.slice(0, SPEECH_MAX_SEGMENT_LENGTH);
-    const cut = Math.max(
-      window.lastIndexOf("，"),
-      window.lastIndexOf(","),
-      window.lastIndexOf("、"),
-      window.lastIndexOf(" "),
-      window.lastIndexOf("\n"),
-    );
-    let end = cut > 0 ? cut + 1 : SPEECH_MAX_SEGMENT_LENGTH;
-    // Never cut a surrogate pair in half; a lone surrogate is not valid JSON text downstream.
-    if (end < rest.length) {
-      const before = rest.charCodeAt(end - 1);
-      const after = rest.charCodeAt(end);
-      if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) end -= 1;
-    }
-    if (end <= 0) end = SPEECH_MAX_SEGMENT_LENGTH;
-    parts.push(rest.slice(0, end));
-    rest = rest.slice(end);
-  }
-  if (rest) parts.push(rest);
-  return parts;
 }
 
 /** Pending sends use negative temporary ids; they must sort after persisted messages. */
@@ -598,9 +526,8 @@ function ChatPage({
   const recorderRef = useRef<MediaRecorder | null>(null);
   const recordingStreamRef = useRef<MediaStream | null>(null);
   const recordingChunksRef = useRef<Blob[]>([]);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const speechRef = useRef<StreamingSpeech | null>(null);
   const playTokenRef = useRef(0);
-  const speechCacheRef = useRef(new Map<number, SpeechSynthesisResult[]>());
 
   useEffect(() => {
     let active = true;
@@ -622,11 +549,11 @@ function ChatPage({
   }, [messages, sending]);
 
   useEffect(() => () => {
-    // Invalidate any in-flight playback before pausing so its loop cannot stay pending forever.
+    // Invalidate any in-flight playback before stopping so a late result cannot revive it.
     playTokenRef.current += 1;
     recorderRef.current?.stop();
     recordingStreamRef.current?.getTracks().forEach((track) => track.stop());
-    audioRef.current?.pause();
+    speechRef.current?.stop();
   }, []);
 
   useEffect(() => {
@@ -657,12 +584,8 @@ function ChatPage({
   function stopSpeech() {
     // Bumping the token invalidates any in-flight synthesis and playback of the previous message.
     playTokenRef.current += 1;
-    const audio = audioRef.current;
-    if (audio) {
-      audio.pause();
-      audio.currentTime = 0;
-    }
-    audioRef.current = null;
+    speechRef.current?.stop();
+    speechRef.current = null;
     setSpeakingMessageId(null);
   }
 
@@ -670,74 +593,19 @@ function ChatPage({
     if (!message.content.trim()) return;
     stopSpeech();
     const token = playTokenRef.current;
-    const segments = splitSpeechSegments(message.content);
-    if (segments.length === 0) return;
     setSpeakingMessageId(message.id);
-
-    const cached = speechCacheRef.current.get(message.id);
-    const cachedSegments = cached && cached.length === segments.length ? cached : null;
-    if (!cachedSegments) speechCacheRef.current.delete(message.id);
-
-    const synthesized: SpeechSynthesisResult[] = [];
-    const pendingSynthesis = new Map<string, Promise<SpeechSynthesisResult>>();
-    function segmentSynthesis(segment: string): Promise<SpeechSynthesisResult> {
-      const existing = pendingSynthesis.get(segment);
-      if (existing) return existing;
-      const promise = synthesizeSpeech(segment);
-      // A prefetched request must not surface as an unhandled rejection when playback stops.
-      promise.catch(() => undefined);
-      pendingSynthesis.set(segment, promise);
-      return promise;
-    }
-    const isStale = () => playTokenRef.current !== token;
-
-    let currentAudio: HTMLAudioElement | null = null;
+    const speech = playStreamingSpeech(message.content, undefined);
+    speechRef.current = speech;
     try {
-      for (const [index, segment] of segments.entries()) {
-        const cachedResult = cachedSegments?.[index];
-        const result = cachedResult ?? await segmentSynthesis(segment);
-        if (isStale()) return;
-        if (!cachedResult) {
-          // Prefetch one segment ahead so synthesis of the next sentence overlaps playback.
-          const nextSegment = segments[index + 1];
-          if (nextSegment) void segmentSynthesis(nextSegment);
-        }
-        synthesized.push(result);
-        const audio = new Audio(`data:${result.contentType};base64,${result.audioBase64}`);
-        currentAudio = audio;
-        audioRef.current = audio;
-        const playbackDone = new Promise<void>((resolve, reject) => {
-          audio.onended = () => {
-            if (audioRef.current === audio) audioRef.current = null;
-            resolve();
-          };
-          audio.onerror = () => {
-            if (audioRef.current === audio) audioRef.current = null;
-            reject(new Error("语音播放失败，请重试或检查语音服务设置"));
-          };
-          // stopSpeech() pauses the element instead of ending it; resolve so the loop can
-          // notice the stale token instead of waiting forever.
-          audio.onpause = () => {
-            if (isStale()) resolve();
-          };
-        });
-        // If the element errors before the loop awaits this promise, it must not become an
-        // unhandled rejection; the loop still observes the rejection at `await playbackDone`.
-        void playbackDone.catch(() => undefined);
-        await audio.play();
-        if (isStale()) return;
-        await playbackDone;
-        if (isStale()) return;
-      }
-      speechCacheRef.current.set(message.id, synthesized);
-      audioRef.current = null;
-      setSpeakingMessageId(null);
+      await speech.done;
     } catch (error) {
+      if (playTokenRef.current === token) setNotice(errorMessage(error));
+    } finally {
       // A superseded playback must not clear the state of the one that replaced it.
-      if (isStale()) return;
-      if (audioRef.current === currentAudio) audioRef.current = null;
-      setSpeakingMessageId(null);
-      setNotice(errorMessage(error));
+      if (playTokenRef.current === token) {
+        speechRef.current = null;
+        setSpeakingMessageId(null);
+      }
     }
   }
 
@@ -1221,13 +1089,13 @@ function TtsSettingsCard({ settings, onChange }: {
 }) {
   const [previewing, setPreviewing] = useState(false);
   const [previewNotice, setPreviewNotice] = useState<string | null>(null);
-  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const previewRef = useRef<StreamingSpeech | null>(null);
 
-  useEffect(() => () => previewAudioRef.current?.pause(), []);
+  useEffect(() => () => previewRef.current?.stop(), []);
 
   function stopPreview() {
-    previewAudioRef.current?.pause();
-    previewAudioRef.current = null;
+    previewRef.current?.stop();
+    previewRef.current = null;
     setPreviewing(false);
   }
 
@@ -1252,28 +1120,17 @@ function TtsSettingsCard({ settings, onChange }: {
           pitch: settings.ttsPitch,
           volume: settings.ttsVolume,
         };
+    const speech = playStreamingSpeech("你好呀，想和你聊聊今天吗？", options);
+    previewRef.current = speech;
     try {
-      const result = await synthesizeSpeech("你好呀，想和你聊聊今天吗？", options);
-      const audio = new Audio(`data:${result.contentType};base64,${result.audioBase64}`);
-      previewAudioRef.current = audio;
-      audio.onended = () => {
-        if (previewAudioRef.current === audio) {
-          previewAudioRef.current = null;
-          setPreviewing(false);
-        }
-      };
-      audio.onerror = () => {
-        if (previewAudioRef.current === audio) {
-          previewAudioRef.current = null;
-          setPreviewing(false);
-          setPreviewNotice("试听没有成功，再试一次吧");
-        }
-      };
-      await audio.play();
+      await speech.done;
     } catch (error) {
-      previewAudioRef.current = null;
-      setPreviewing(false);
-      setPreviewNotice(errorMessage(error));
+      if (previewRef.current === speech) setPreviewNotice(errorMessage(error));
+    } finally {
+      if (previewRef.current === speech) {
+        previewRef.current = null;
+        setPreviewing(false);
+      }
     }
   }
 

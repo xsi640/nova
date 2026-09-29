@@ -11,7 +11,7 @@
 - 聊天、记忆、日程、角色设定和应用设置仅保存于本机 SQLite 数据库；第一版不设置数据库密码，也不加密数据库文件。
 - API Key 可在设置页配置、修改和测试，但明文只能保存在操作系统凭据存储中。
 - 低频输入检测只产生空闲状态和持续时间，不采集键盘内容、鼠标位置或具体操作。
-- 对话和语音识别支持独立的 OpenAI 兼容 API 配置，且可复用同一 API Key；语音合成由 `tts_provider` 切换：默认 **Edge TTS 在线语音（免费、无需 Key）**，另可选 **火山引擎豆包语音（在线，需访问密钥）**。设置页先选语音方式，再配置该方式自己的音色与参数。
+- 对话和语音识别支持独立的 OpenAI 兼容 API 配置，且可复用同一 API Key；语音合成由 `tts_provider` 切换：默认 **Edge TTS 在线语音（免费、无需 Key）**，另可选 **火山引擎豆包语音（在线，需 API Key）**。设置页先选语音方式，再配置该方式自己的音色与参数；合成结果按 WebSocket 帧流式返回，前端边收边播。
 - 第一版只要求开发环境直接运行，不产出安装包。
 
 ## 2. 交付形态与运行环境
@@ -122,7 +122,7 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 |---|---|---|---|
 | 本地命令 | bootstrap | MODULE-001、MODULE-008 | 读取窗口状态及数据清空后是否需要引导 |
 | 本地命令 | save_persona、get_persona | MODULE-001 | 管理虚拟女友设定 |
-| 本地命令 | send_message、transcribe_audio、synthesize_speech | MODULE-002 | 文字与语音交互 |
+| 本地命令 | send_message、transcribe_audio、synthesize_speech_stream | MODULE-002 | 文字与语音交互；合成通过 Tauri Channel 流式返回音频帧 |
 | 本地命令 | list_memories、update_memory、delete_memory、export_data | MODULE-003、MODULE-006 | 管理与导出数据 |
 | 本地命令 | confirm_schedule、list_schedules、update_schedule、delete_schedule | MODULE-005 | 管理应用内日程 |
 | 本地命令 | save_api_profile、test_api_profile、get_api_profile_status | MODULE-008 | 配置、测试和读取脱敏 API 状态 |
@@ -136,7 +136,7 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 |---|---|---|
 | 对话 | `POST /chat/completions` | base URL、路径、模型、API Key 引用 |
 | 语音识别 | `POST /audio/transcriptions` | base URL、路径、模型、API Key 引用 |
-| 语音合成 | Edge TTS WebSocket（默认）或火山引擎 v3 双向流式 WebSocket | edge：音色、语速、音调、音量，无需 API Key；volcengine：`wss://openspeech.bytedance.com/api/v3/tts/bidirection`，单个 `X-Api-Key`，资源 `seed-tts-2.0`，模型/音色/语速/音量可配，MP3 输出 |
+| 语音合成 | Edge TTS WebSocket（默认）或火山引擎 v3 双向流式 WebSocket | edge：音色、语速、音调、音量，无需 API Key；volcengine：`wss://openspeech.bytedance.com/api/v3/tts/bidirection`，单个 `X-Api-Key`，资源 `seed-tts-2.0`，模型/音色/语速/音量可配，MP3 输出；两者都按帧流式返回，前端用 MediaSource 播放 |
 
 - 对话和语音识别各有配置资料，允许它们指向同一供应商或不同供应商；语音合成不创建自定义 API 配置。
 - 远端请求统一由 Rust 发送，并使用 `Authorization: Bearer <API Key>`。

@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 
 export type AppErrorCategory =
   | "configuration"
@@ -117,10 +117,9 @@ export interface TranscriptionResult {
   text: string;
 }
 
-export interface SpeechSynthesisResult {
-  audioBase64: string;
-  contentType: string;
-}
+export type SpeechStreamEvent =
+  | { type: "start"; contentType: string }
+  | { type: "chunk"; data: string };
 
 export interface MemoryRecord {
   id: number;
@@ -242,11 +241,14 @@ export async function transcribeAudio(
   return invoke<TranscriptionResult>("transcribe_audio", { audio, fileName, mimeType });
 }
 
-export async function synthesizeSpeech(
+export async function synthesizeSpeechStream(
   text: string,
-  options?: SpeechOptions,
-): Promise<SpeechSynthesisResult> {
-  return invoke<SpeechSynthesisResult>("synthesize_speech", { text, options });
+  options: SpeechOptions | undefined,
+  onEvent: (event: SpeechStreamEvent) => void,
+): Promise<void> {
+  const channel = new Channel<SpeechStreamEvent>();
+  channel.onmessage = onEvent;
+  await invoke<void>("synthesize_speech_stream", { text, options, onEvent: channel });
 }
 
 export async function listMemories(): Promise<MemoryRecord[]> {

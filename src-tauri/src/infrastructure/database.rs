@@ -1173,6 +1173,27 @@ fn migrate(connection: &mut Connection) -> Result<(), AppError> {
         })?;
     }
 
+    if current_version < 11 {
+        let transaction = connection.transaction().map_err(|error| {
+            AppError::database(format!("failed to start database migration 11: {error}"))
+        })?;
+        // Drop the superseded Volcengine columns: migration 9 stored an OpenAI-compatible gateway
+        // URL/speed, and migration 10 added an App ID that the API-key flow does not use.
+        transaction
+            .execute_batch(
+                "ALTER TABLE app_settings DROP COLUMN volc_api_url;
+                 ALTER TABLE app_settings DROP COLUMN volc_speed;
+                 ALTER TABLE app_settings DROP COLUMN volc_app_id;
+                 INSERT INTO schema_migrations (version) VALUES (11);",
+            )
+            .map_err(|error| {
+                AppError::database(format!("failed to apply database migration 11: {error}"))
+            })?;
+        transaction.commit().map_err(|error| {
+            AppError::database(format!("failed to commit database migration 11: {error}"))
+        })?;
+    }
+
     Ok(())
 }
 
