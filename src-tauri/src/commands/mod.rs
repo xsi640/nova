@@ -387,10 +387,11 @@ fn validate_base_url(value: String) -> Result<String, CommandError> {
 /// an authorization response is still surfaced as an invalid key. This deliberately avoids a
 /// billable transcription or speech-generation request during settings validation.
 fn test_capability_connection(url: &str, api_key: &str) -> Result<ApiTestResult, CommandError> {
-    let client = http_client(Duration::from_secs(15))?;
+    let client = http_client()?;
     let started = Instant::now();
     let response = client
         .request(reqwest::Method::OPTIONS, url)
+        .timeout(Duration::from_secs(15))
         .bearer_auth(api_key)
         .send()
         .map_err(|error| AppError::Network(format!("连接 API 失败：{error}")))?;
@@ -891,6 +892,28 @@ pub async fn retry_message(
     .await
 }
 
+/// Keeps only the most recent turns within a bounded size. Re-sending the whole conversation on
+/// every reply mostly adds latency (and cost) without changing a companion's tone.
+fn recent_remote_messages(messages: Vec<ChatMessage>) -> Vec<RemoteChatMessage> {
+    const MAX_MESSAGES: usize = 16;
+    const MAX_CHARS: usize = 6_000;
+    let mut selected: Vec<RemoteChatMessage> = Vec::new();
+    let mut chars = 0usize;
+    for message in messages.into_iter().rev() {
+        let length = message.content.chars().count();
+        if !selected.is_empty() && (selected.len() >= MAX_MESSAGES || chars + length > MAX_CHARS) {
+            break;
+        }
+        chars += length;
+        selected.push(RemoteChatMessage {
+            role: message.role,
+            content: message.content,
+        });
+    }
+    selected.reverse();
+    selected
+}
+
 async fn complete_chat(
     database: &Database,
     user_message: ChatMessage,
@@ -908,7 +931,7 @@ async fn complete_chat(
             role: "system".to_owned(),
             content: build_system_prompt(&persona),
         }];
-        messages.extend(
+        messages.extend(recent_remote_messages(
             database
                 .list_chat_messages()?
                 .into_iter()
@@ -916,16 +939,8 @@ async fn complete_chat(
                     (message.status == "sent" || message.id == user_message.id)
                         && matches!(message.role.as_str(), "user" | "assistant")
                 })
-                .rev()
-                .take(40)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(|message| RemoteChatMessage {
-                    role: message.role,
-                    content: message.content,
-                }),
-        );
+                .collect(),
+        ));
         let endpoint = format!("{}{}", profile.base_url.trim_end_matches('/'), profile.path);
         let request = ChatCompletionRequest {
             model: profile.model,
@@ -976,7 +991,7 @@ async fn complete_chat_stream(
             role: "system".to_owned(),
             content: build_system_prompt(&persona),
         }];
-        messages.extend(
+        messages.extend(recent_remote_messages(
             database
                 .list_chat_messages()?
                 .into_iter()
@@ -984,16 +999,8 @@ async fn complete_chat_stream(
                     (message.status == "sent" || message.id == user_message.id)
                         && matches!(message.role.as_str(), "user" | "assistant")
                 })
-                .rev()
-                .take(40)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .map(|message| RemoteChatMessage {
-                    role: message.role,
-                    content: message.content,
-                }),
-        );
+                .collect(),
+        ));
         let endpoint = format!("{}{}", profile.base_url.trim_end_matches('/'), profile.path);
         let request = ChatCompletionRequest {
             model: profile.model,
@@ -1099,7 +1106,7 @@ fn request_chat_completion(
     api_key: &str,
     request: &ChatCompletionRequest,
 ) -> Result<String, CommandError> {
-    let client = http_client(Duration::from_secs(90))?;
+    let client = http_client()?;
     let response = client
         .post(url)
         .bearer_auth(api_key)
@@ -1132,9 +1139,10 @@ fn request_chat_completion_stream(
     request: &ChatCompletionRequest,
     on_delta: &mut dyn FnMut(&str) -> Result<(), CommandError>,
 ) -> Result<String, CommandError> {
-    let client = http_client(Duration::from_secs(180))?;
+    let client = http_client()?;
     let response = client
         .post(url)
+        .timeout(Duration::from_secs(180))
         .bearer_auth(api_key)
         .json(request)
         .send()
@@ -1199,13 +1207,20 @@ fn request_chat_completion_stream(
     fallback.ok_or_else(|| AppError::Service("对话 API 没有返回文字内容".to_owned()).into())
 }
 
-fn http_client(timeout: Duration) -> Result<reqwest::blocking::Client, CommandError> {
-    let client_builder = reqwest::blocking::Client::builder().timeout(timeout);
+/// One shared client so repeated chat turns reuse the connection pool instead of paying for a new
+/// TCP + TLS handshake on every request.
+fn http_client() -> Result<reqwest::blocking::Client, CommandError> {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client_builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(90));
     #[cfg(test)]
     let client_builder = client_builder.no_proxy();
-    client_builder
+    let client = client_builder
         .build()
-        .map_err(|error| AppError::internal(format!("无法创建网络客户端：{error}")).into())
+        .map_err(|error| AppError::internal(format!("无法创建网络客户端：{error}")))?;
+    Ok(CLIENT.get_or_init(|| client).clone())
 }
 
 const MAX_AUDIO_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
@@ -1416,8 +1431,9 @@ fn request_transcription(
     let form = Form::new()
         .text("model", model.to_owned())
         .part("file", file);
-    let response = http_client(Duration::from_secs(90))?
+    let response = http_client()?
         .post(url)
+        .timeout(Duration::from_secs(90))
         .bearer_auth(api_key)
         .multipart(form)
         .send()
@@ -1597,6 +1613,24 @@ mod tests {
         .expect("chunk serializes");
         assert_eq!(chunk["type"], "chunk");
         assert_eq!(chunk["data"], "abc");
+    }
+
+    #[test]
+    fn keeps_only_the_recent_chat_window() {
+        use crate::infrastructure::database::ChatMessage;
+        let messages = (0..40)
+            .map(|id| ChatMessage {
+                id,
+                role: if id % 2 == 0 { "user" } else { "assistant" }.to_owned(),
+                content: "x".repeat(50),
+                created_at: String::new(),
+                status: "sent".to_owned(),
+            })
+            .collect();
+        let trimmed = super::recent_remote_messages(messages);
+        assert_eq!(trimmed.len(), 16);
+        // The window keeps the newest messages, in chronological order.
+        assert_eq!(trimmed.last().expect("has a newest message").role, "assistant");
     }
 
     #[test]
