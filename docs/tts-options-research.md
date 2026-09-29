@@ -8,11 +8,28 @@
 
 这最符合 Nova 的本地优先方向和“不要在本机编译依赖”的约束。运行时源码是 Apache-2.0；**模型权利必须按最终选用的具体模型再次核验**，不要将“运行时开源”误当成全部模型均可自由再分发。
 
+> 2026-09-29 更新：实际落地方案改为 **Piper（`rhasspy/piper` 预编译运行时 + 中文音色）**，理由与细节见下方「已落地实现」。sherpa-onnx 仍是有预编译发布物的备选，但 Piper 的运行时包更小（22 MB）、音色目录与说话风格更适合对话场景，且能完全复用相同的 sidecar + SHA-256 下载模式。
+
 ## 当前实现决定
 
-Nova 当前固定使用 **Rust 直接实现的 Edge TTS WebSocket 客户端**：不依赖 Python、`edge-tts` CLI 或外部 sidecar。它仅在用户点击朗读或开启自动朗读时将待朗读文本发送至 Edge 在线服务，并将 MP3 字节返回给前端内存播放。
+Nova 现在同时保留两种语音合成方式，由 `app_settings.tts_provider` 切换，默认值按平台推导：
 
-设置页只开放 Edge TTS 的可控参数：音色、语速、音调和音量。当前版本暂不支持自定义 OpenAI 兼容语音合成接口；对话和语音识别仍可分别配置 OpenAI 兼容 API。
+- **`piper`（离线，Windows x64 默认）**：下载并校验预编译 Piper 运行时与中文音色模型到应用数据目录，作为 sidecar 进程在本机合成 WAV，不联网、不需要 API Key。运行时不随安装包分发。
+- **`edge`（在线备选）**：Rust 直接实现的 Edge TTS WebSocket 客户端，仅在朗读时把文本发送到 Edge 在线服务并返回 MP3；非 Windows 平台在没有 Piper 运行时前默认使用它。
+
+两种方式共用同一份「Markdown → 可朗读文本」清洗（`speech_text::prepare_for_speech`），保证朗读内容一致。设置页开放语音方式、音色与语速；Piper 只有语速（对应 `--length_scale`），因此 **piper 模式下隐藏声调/音量**，edge 模式仍开放音色、语速、音调和音量。当前版本仍不支持自定义 OpenAI 兼容语音合成接口。
+
+## 已落地实现（Piper，2026-09-29）
+
+| 项目 | 结论 |
+| --- | --- |
+| 运行时 | `rhasspy/piper` release `2023.11.14-2` 的 `piper_windows_amd64.zip`（22,477,236 B，sha256 `f3c58906…`，**MIT**） |
+| 音色 | `zh_CN-huayan-medium`（63,201,294 B，默认）、`zh_CN-huayan-x_low`（20,628,813 B）；URL + 字节数 + sha256 全部 pin 在 `src-tauri/src/piper_tts.rs` |
+| 不采用的运行时 | `OHF-Voice/piper1-gpl` ≥ 1.3 为 **GPL-3.0**，且只发布 Python wheel（无独立 Windows exe），不能作为 sidecar |
+| 不采用的音色 | `zh_CN-chaowen-medium`、`zh_CN-xiao_ya-medium` 在本项目 pin 的运行时上报错 `"ai" is not a single codepoint`（需要 piper 1.4+/g2pW），已从清单移除 |
+| 完整性 | 下载先校验字节数再校验 sha256，不匹配即删除并报错；解包用 `enclosed_name()` 防路径穿越 |
+| 安装位置 | `<app_data>/piper/runtime/`、`<app_data>/piper/voices/`；设置页按需下载并显示进度 |
+| 许可风险 | 运行时 MIT 可分发；但**音色数据集许可不同**：`huayan` 的数据集 `PlayVoice/HuaYan_TTS` 在 model card 标注为 **License: Unknown**，需产品确认后再决定是否随产品分发/推荐 |
 
 ## 候选对比
 
@@ -20,7 +37,8 @@ Nova 当前固定使用 **Rust 直接实现的 Edge TTS WebSocket 客户端**：
 | --- | --- | --- | --- | --- | --- |
 | sherpa-onnx（VITS / MeloTTS 模型） | 免费、离线 | 有中英模型，及 5/174/187/804 说话人模型；模型约 115–163 MB | 官方有预编译发布物；可由 Tauri 后端调用独立 exe | runtime 为 Apache-2.0；逐个审查模型许可证 | **首选** |
 | Kokoro 82M + 本地 OpenAI 兼容服务 | 免费、离线 | 中文优化检查点有 8 个普通话音色 | 需带 Docker/Python+ONNX Runtime 服务；首次模型下载约 330 MB | Kokoro 仓库为 Apache-2.0；部署体积与服务管理较重 | 质量优先时的备选 |
-| edge-tts | 无 API Key，但必须联网 | Microsoft Neural 音色丰富，中文效果通常好 | Rust 直接实现协议，不需要 Python/sidecar；服务端变更会导致失效 | 项目主体 LGPLv3；还依赖未承诺的 Edge 在线服务 | 当前版本采用；设置页开放音色、语速、音调和音量 |
+| edge-tts | 无 API Key，但必须联网 | Microsoft Neural 音色丰富，中文效果通常好 | Rust 直接实现协议，不需要 Python/sidecar；服务端变更会导致失效 | 项目主体 LGPLv3；还依赖未承诺的 Edge 在线服务 | 在线备选（非 Windows 平台默认） |
+| Piper（`rhasspy/piper` 预编译运行时） | 免费、离线 | 预编译运行时仅 Windows x64；中文音色需逐个实测兼容性 | 已有可用的 Windows x64 运行时；sidecar exe，不编译原生依赖 | 运行时 MIT；**音色数据集许可需逐个核验**（见上表） | **当前采用**（离线默认） |
 
 ## 证据与实现线索
 
@@ -44,14 +62,15 @@ Nova 当前固定使用 **Rust 直接实现的 Edge TTS WebSocket 客户端**：
 
 ## 后续可选方向
 
-1. 如需完全离线，再将 TTS 抽象为 `SpeechProvider`，增加 `LocalSherpaProvider`；当前 Edge TTS 实现保持不变。
-2. 默认不随安装包塞入模型；设置页提供“下载免费离线语音包”，显示下载体积、许可证与删除按钮。
-3. 首个预置包采用一个已复核许可的中文模型；音色选择只暴露该模型实际支持的 speaker/voice。
-4. 后端把文本切句、调用预编译 `sherpa-onnx-offline-tts`、输出 WAV 到应用缓存；前端直接播放并在完成后清理缓存。
-5. 下载前校验 SHA-256，运行时与模型按 Windows x64 / ARM64 分开管理；不在用户机器上编译任何原生依赖。
+1. 已将 TTS 抽象为 `SpeechProvider`：`piper`（离线）与 `edge`（在线）；若将来引入 sherpa-onnx，可继续沿用同一抽象。
+2. 默认不随安装包塞入模型；设置页提供“下载离线语音包”，显示下载体积、许可证与进度。
+3. 首个预置包采用一个已复核许可的中文模型；音色选择只暴露实际验证过兼容性的 voice。
+4. 后端把文本切句、调用 sidecar 输出 WAV 到临时目录；前端直接播放。
+5. 下载前校验 SHA-256，运行时与模型按平台/架构分开管理；不在用户机器上编译任何原生依赖。
+6. 可选优化：常驻一个 piper 进程（stdin 逐行输入 + `--output_raw`），降低每句约 0.4 s 的模型重载开销。
 
 ## 尚需决定
 
-- 是否允许用户手动选择任意本地 ONNX 模型，还是只提供我们验证过的语音包。
-- 首版优先“完全离线、可控许可”，还是优先“更自然的云端神经音色”。
-- 是否愿意接受约 120–180 MB 的首次语音包下载；若接受，sherpa-onnx 的本地方案最平衡。
+- 是否允许用户手动选择任意本地 ONNX 模型，还是只提供我们验证过的语音包（当前只支持 pin 住的两个 huayan 音色）。
+- `huayan` 数据集许可为 Unknown，是否继续作为默认推荐音色，或改用许可更清晰但需解决运行时版本问题的音色。
+- 是否把 Piper 运行时作为 Tauri resource 随包分发（省掉 22 MB 下载，但引入 MIT 二进制再分发与体积问题）。

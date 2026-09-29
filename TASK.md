@@ -31,7 +31,9 @@
 
 说明：已把已验证的 `piper/runtime` 与 `piper/voices/zh_CN-huayan-medium.onnx(.json)` 从 `%TEMP%\piper-verify-c` 复制进 `%APPDATA%\app.nova.companion\piper\`，本机可直接试听/朗读，无需再下载 85 MB。
 
-仍未完成：**UI 人工走查**（下载进度条、试听、聊天朗读与自动播放的实际交互未由本人点击验证）；**P1 文档更新**（`docs/tts-options-research.md`、`docs/tech-architecture.md`、`docs/tasks.md`）与 TASK-016 的 Piper 时延重测；K-4（huayan 数据集许可 Unknown）仍需产品确认。
+仍未完成：**UI 人工走查**（下载进度条、试听、聊天朗读与自动播放的实际交互未由本人点击验证）；**TASK-016 的 Piper 时延重测**；K-4（huayan 数据集许可 Unknown）仍需产品确认。
+
+P1 状态：**文档更新已完成**（`docs/tts-options-research.md`、`docs/tech-architecture.md`、`docs/tasks.md` 已同步为 Piper 离线默认 + Edge 在线备选，新增 TASK-017）。
 
 ---
 
