@@ -1053,7 +1053,7 @@ struct TranscriptionResponse {
 /// Events streamed back to the frontend while an utterance is synthesized, so playback can begin
 /// before the whole audio payload is ready.
 #[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase", tag = "type")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "type")]
 pub enum TtsStreamEvent {
     /// Sent once before the first chunk so the player knows the audio container.
     Start { content_type: String },
@@ -1408,8 +1408,25 @@ mod tests {
 
     use crate::error::ErrorCategory;
 
-    use super::BootstrapResponse;
+    use super::{BootstrapResponse, TtsStreamEvent};
     use crate::infrastructure::database::PersonaProfile;
+
+    #[test]
+    fn tts_stream_events_use_camel_case_fields() {
+        let start = serde_json::to_value(TtsStreamEvent::Start {
+            content_type: "audio/mpeg".to_owned(),
+        })
+        .expect("start serializes");
+        assert_eq!(start["type"], "start");
+        assert_eq!(start["contentType"], "audio/mpeg");
+
+        let chunk = serde_json::to_value(TtsStreamEvent::Chunk {
+            data: "abc".to_owned(),
+        })
+        .expect("chunk serializes");
+        assert_eq!(chunk["type"], "chunk");
+        assert_eq!(chunk["data"], "abc");
+    }
 
     fn mock_api(status: &str) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock API");
