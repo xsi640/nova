@@ -123,7 +123,7 @@ pub fn save_persona(
 #[tauri::command]
 pub fn get_settings(database: State<'_, Database>) -> Result<AppSettings, CommandError> {
     let mut settings = database.get_settings()?;
-    settings.volc_access_token_set = credentials::secret_exists(volcengine_tts::SECRET_REFERENCE)?;
+    settings.volc_api_key_set = credentials::secret_exists(volcengine_tts::SECRET_REFERENCE)?;
     Ok(settings)
 }
 
@@ -140,12 +140,12 @@ pub fn save_settings(
     let provider = SpeechProvider::parse(&settings.tts_provider)?;
     settings.tts_provider = provider.as_str().to_owned();
 
-    let existing_token = credentials::secret_exists(volcengine_tts::SECRET_REFERENCE)?;
-    let new_token = settings
-        .volc_access_token
+    let existing_key = credentials::secret_exists(volcengine_tts::SECRET_REFERENCE)?;
+    let new_key = settings
+        .volc_api_key
         .take()
-        .map(|token| token.trim().to_owned())
-        .filter(|token| !token.is_empty());
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty());
 
     match provider {
         SpeechProvider::Edge => {
@@ -162,33 +162,31 @@ pub fn save_settings(
         }
         SpeechProvider::Volcengine => {
             let volc = volcengine_tts::validate_options(volcengine_tts::VolcOptions {
-                app_id: settings.volc_app_id.clone(),
                 resource_id: settings.volc_resource_id.clone(),
                 model: settings.volc_model.clone(),
                 voice: settings.volc_voice.clone(),
                 speech_rate: settings.volc_speech_rate,
                 loudness_rate: settings.volc_loudness_rate,
             })?;
-            settings.volc_app_id = volc.app_id;
             settings.volc_resource_id = volc.resource_id;
             settings.volc_model = volc.model;
             settings.volc_voice = volc.voice;
             settings.volc_speech_rate = volc.speech_rate;
             settings.volc_loudness_rate = volc.loudness_rate;
-            if new_token.is_none() && !existing_token {
+            if new_key.is_none() && !existing_key {
                 return Err(AppError::Configuration(
-                    "请填写火山引擎 Access Token".to_owned(),
+                    "请填写火山引擎 API Key".to_owned(),
                 )
                 .into());
             }
         }
     }
     database.save_settings(&settings)?;
-    if let Some(token) = new_token {
-        credentials::set_secret(volcengine_tts::SECRET_REFERENCE, &token)?;
+    if let Some(key) = new_key {
+        credentials::set_secret(volcengine_tts::SECRET_REFERENCE, &key)?;
     }
-    settings.volc_access_token_set =
-        existing_token || credentials::secret_exists(volcengine_tts::SECRET_REFERENCE)?;
+    settings.volc_api_key_set =
+        existing_key || credentials::secret_exists(volcengine_tts::SECRET_REFERENCE)?;
     Ok(settings)
 }
 
@@ -1071,7 +1069,6 @@ pub struct SpeechOptions {
     rate: Option<i32>,
     pitch: Option<i32>,
     volume: Option<i32>,
-    app_id: Option<String>,
     resource_id: Option<String>,
     model: Option<String>,
     speech_rate: Option<i32>,
@@ -1140,16 +1137,15 @@ pub async fn synthesize_speech(
             result.map_err(Into::into)
         }
         SpeechProvider::Volcengine => {
-            let access_token = match options
+            let api_key = match options
                 .api_key
-                .map(|token| token.trim().to_owned())
-                .filter(|token| !token.is_empty())
+                .map(|key| key.trim().to_owned())
+                .filter(|key| !key.is_empty())
             {
-                Some(token) => token,
+                Some(key) => key,
                 None => credentials::get_secret(volcengine_tts::SECRET_REFERENCE)?,
             };
             let volc = volcengine_tts::validate_options(volcengine_tts::VolcOptions {
-                app_id: options.app_id.unwrap_or_else(|| settings.volc_app_id.clone()),
                 resource_id: options
                     .resource_id
                     .unwrap_or_else(|| settings.volc_resource_id.clone()),
@@ -1159,7 +1155,7 @@ pub async fn synthesize_speech(
                 loudness_rate: options.loudness_rate.unwrap_or(settings.volc_loudness_rate),
             })?;
             let result = tauri::async_runtime::spawn_blocking(move || {
-                volcengine_tts::synthesize(&input, &volc, &access_token).map(|audio| {
+                volcengine_tts::synthesize(&input, &volc, &api_key).map(|audio| {
                     SpeechSynthesisResult {
                         audio_base64: BASE64.encode(audio.bytes),
                         content_type: audio.content_type,

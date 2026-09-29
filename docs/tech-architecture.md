@@ -24,7 +24,7 @@
 | macOS 运行环境 | macOS 13+、Apple Silicon 或 Intel、Xcode Command Line Tools |
 | 前端运行环境 | Node.js 24.14.0、npm 11.9.0 |
 | 本地启动方式 | `npm run tauri dev` |
-| 远端依赖 | 用户自行配置的对话/语音识别 OpenAI 兼容 API；Edge TTS 在线服务；可选火山引擎豆包语音合成 2.0（v3 WebSocket，需 App ID + Access Token） |
+| 远端依赖 | 用户自行配置的对话/语音识别 OpenAI 兼容 API；Edge TTS 在线服务；可选火山引擎豆包语音合成 2.0（v3 WebSocket，需 API Key） |
 | 数据位置 | 应用数据目录中的明文 SQLite 数据库 |
 
 Windows 开发依赖 Microsoft C++ Build Tools 与 WebView2；macOS 开发需要 Xcode Command Line Tools。Tauri 官方前置条件说明了这些平台依赖。[Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
@@ -95,7 +95,7 @@ React UI
 | memories | id、content、source_message_id、created_at、updated_at | 自动形成且可人工管理的长期记忆 |
 | schedules | id、title、scheduled_at、remind_at、source_message_id、status | 应用内日程及其提醒状态 |
 | proactive_events | id、message_id、idle_started_at、notified_at、opened_at | 主动陪伴消息与通知状态 |
-| app_settings | theme、dark_mode、dnd_start、dnd_end、voice_autoplay、tts_provider、tts_voice、tts_rate、tts_pitch、tts_volume、volc_app_id、volc_resource_id、volc_model、volc_voice、volc_speech_rate、volc_loudness_rate、onboarding_required | 非敏感应用行为、语音合成设置（`tts_provider` 为 `edge` / `volcengine`，两种方式的参数各自保留）及保留的恢复引导状态 |
+| app_settings | theme、dark_mode、dnd_start、dnd_end、voice_autoplay、tts_provider、tts_voice、tts_rate、tts_pitch、tts_volume、volc_resource_id、volc_model、volc_voice、volc_speech_rate、volc_loudness_rate、onboarding_required | 非敏感应用行为、语音合成设置（`tts_provider` 为 `edge` / `volcengine`，两种方式的参数各自保留）及保留的恢复引导状态 |
 
 ### 本地存储与密钥策略
 
@@ -128,7 +128,7 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 | 本地命令 | save_api_profile、test_api_profile、get_api_profile_status | MODULE-008 | 配置、测试和读取脱敏 API 状态 |
 | 本地命令 | save_settings、get_settings | MODULE-004、MODULE-007 | 管理免打扰、主题、语音播放和语音方式/音色设置 |
 
-语音合成的火山引擎 Access Token 不进入数据表：它由 MODULE-008 写入系统凭据存储（引用名 `tts-volcengine`），`get_settings` 只返回是否已保存。App ID 非敏感，存在 `app_settings`。
+语音合成的火山引擎 API Key 不进入数据表：它由 MODULE-008 写入系统凭据存储（引用名 `tts-volcengine`），`get_settings` 只返回是否已保存。
 
 ### 远端 API 适配
 
@@ -136,7 +136,7 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 |---|---|---|
 | 对话 | `POST /chat/completions` | base URL、路径、模型、API Key 引用 |
 | 语音识别 | `POST /audio/transcriptions` | base URL、路径、模型、API Key 引用 |
-| 语音合成 | Edge TTS WebSocket（默认）或火山引擎 v3 双向流式 WebSocket | edge：音色、语速、音调、音量，无需 API Key；volcengine：`wss://openspeech.bytedance.com/api/v3/tts/bidirection`，App ID + Access Token，资源 `seed-tts-2.0`，模型/音色/语速/音量可配，MP3 输出 |
+| 语音合成 | Edge TTS WebSocket（默认）或火山引擎 v3 双向流式 WebSocket | edge：音色、语速、音调、音量，无需 API Key；volcengine：`wss://openspeech.bytedance.com/api/v3/tts/bidirection`，单个 `X-Api-Key`，资源 `seed-tts-2.0`，模型/音色/语速/音量可配，MP3 输出 |
 
 - 对话和语音识别各有配置资料，允许它们指向同一供应商或不同供应商；语音合成不创建自定义 API 配置。
 - 远端请求统一由 Rust 发送，并使用 `Authorization: Bearer <API Key>`。
@@ -189,8 +189,7 @@ React 只能通过 Tauri 命令调用 Rust 服务。命令以模块为边界，�
 ## 11. 人工确认结论
 
 - 用户已确认 Tauri + React + Rust 方案，且明确要求当前阶段不进行编码。
-- 用户已确认对话和语音识别采用可配置的 OpenAI 兼容 API；语音合成默认采用免费的 Edge TTS，并可选火山引擎豆包语音；设置页先选语音方式，再配置该方式的音色与参数。
-- 用户已确认 API Key 继续由设置页配置；系统凭据存储负责保存密钥，Rust 服务层负责实际调用。
+- 用户已确认对话和语音识别采用可配置的 OpenAI 兼容 API；语音合成默认采用免费的 Edge TTS，并可选火山引擎豆包语音；设置页先选语音方式，再配置该方式的音色与参数。- 用户已确认 API Key 继续由设置页配置；系统凭据存储负责保存密钥，Rust 服务层负责实际调用。
 - 用户已确认 Windows 10/11 x64 与 macOS 13+ Apple Silicon/Intel 支持范围。
 - 用户已确认第一版使用明文 SQLite，不设置数据库密码。
 - 用户已确认低频输入检测不采集键鼠实际内容或位置。

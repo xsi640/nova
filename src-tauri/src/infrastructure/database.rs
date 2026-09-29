@@ -46,18 +46,17 @@ pub struct AppSettings {
     pub tts_pitch: i32,
     pub tts_volume: i32,
     // Volcengine (Doubao Seed-TTS 2.0) options.
-    pub volc_app_id: String,
     pub volc_resource_id: String,
     pub volc_model: String,
     pub volc_voice: String,
     pub volc_speech_rate: i32,
     pub volc_loudness_rate: i32,
-    /// Write-only access token; read back from the credential store instead of the database.
+    /// Write-only API key; read back from the credential store instead of the database.
     #[serde(default, skip_serializing)]
-    pub volc_access_token: Option<String>,
-    /// Whether a Volcengine access token is present in the credential store.
+    pub volc_api_key: Option<String>,
+    /// Whether a Volcengine API key is present in the credential store.
     #[serde(default)]
-    pub volc_access_token_set: bool,
+    pub volc_api_key_set: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +211,7 @@ impl Database {
             .query_row(
                 "SELECT theme, dark_mode, dnd_start, dnd_end, voice_autoplay, proactive_enabled,
                         tts_provider, tts_voice, tts_rate, tts_pitch, tts_volume,
-                        volc_app_id, volc_resource_id, volc_model, volc_voice,
+                        volc_resource_id, volc_model, volc_voice,
                         volc_speech_rate, volc_loudness_rate
                  FROM app_settings WHERE id = 1",
                 [],
@@ -229,14 +228,13 @@ impl Database {
                         tts_rate: row.get(8)?,
                         tts_pitch: row.get(9)?,
                         tts_volume: row.get(10)?,
-                        volc_app_id: row.get(11)?,
-                        volc_resource_id: row.get(12)?,
-                        volc_model: row.get(13)?,
-                        volc_voice: row.get(14)?,
-                        volc_speech_rate: row.get(15)?,
-                        volc_loudness_rate: row.get(16)?,
-                        volc_access_token: None,
-                        volc_access_token_set: false,
+                        volc_resource_id: row.get(11)?,
+                        volc_model: row.get(12)?,
+                        volc_voice: row.get(13)?,
+                        volc_speech_rate: row.get(14)?,
+                        volc_loudness_rate: row.get(15)?,
+                        volc_api_key: None,
+                        volc_api_key_set: false,
                     })
                 },
             )
@@ -258,12 +256,11 @@ impl Database {
                     tts_rate = ?9,
                     tts_pitch = ?10,
                     tts_volume = ?11,
-                    volc_app_id = ?12,
-                    volc_resource_id = ?13,
-                    volc_model = ?14,
-                    volc_voice = ?15,
-                    volc_speech_rate = ?16,
-                    volc_loudness_rate = ?17
+                    volc_resource_id = ?12,
+                    volc_model = ?13,
+                    volc_voice = ?14,
+                    volc_speech_rate = ?15,
+                    volc_loudness_rate = ?16
                  WHERE id = 1",
                 params![
                     settings.theme,
@@ -277,7 +274,6 @@ impl Database {
                     settings.tts_rate,
                     settings.tts_pitch,
                     settings.tts_volume,
-                    settings.volc_app_id,
                     settings.volc_resource_id,
                     settings.volc_model,
                     settings.volc_voice,
@@ -1245,14 +1241,13 @@ mod tests {
             tts_rate: -5,
             tts_pitch: 0,
             tts_volume: 0,
-            volc_app_id: "1234567890".to_owned(),
             volc_resource_id: crate::volcengine_tts::DEFAULT_RESOURCE_ID.to_owned(),
             volc_model: crate::volcengine_tts::DEFAULT_MODEL.to_owned(),
             volc_voice: crate::volcengine_tts::DEFAULT_VOICE.to_owned(),
             volc_speech_rate: 0,
             volc_loudness_rate: 0,
-            volc_access_token: None,
-            volc_access_token_set: false,
+            volc_api_key: None,
+            volc_api_key_set: false,
         };
         database.save_settings(&settings).expect("save settings");
         assert_eq!(database.get_settings().expect("read settings"), settings);
@@ -1292,14 +1287,13 @@ mod tests {
             tts_rate: -5,
             tts_pitch: 0,
             tts_volume: 0,
-            volc_app_id: "1234567890".to_owned(),
             volc_resource_id: crate::volcengine_tts::DEFAULT_RESOURCE_ID.to_owned(),
             volc_model: crate::volcengine_tts::DEFAULT_MODEL.to_owned(),
             volc_voice: crate::volcengine_tts::DEFAULT_VOICE.to_owned(),
             volc_speech_rate: 0,
             volc_loudness_rate: 0,
-            volc_access_token: None,
-            volc_access_token_set: false,
+            volc_api_key: None,
+            volc_api_key_set: false,
         };
         database.save_settings(&settings).expect("save settings");
         let source = database

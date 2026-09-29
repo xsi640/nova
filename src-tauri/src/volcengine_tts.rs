@@ -78,7 +78,6 @@ const CONNECTION_EVENTS: [i32; 5] = [
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VolcOptions {
-    pub app_id: String,
     pub resource_id: String,
     pub model: String,
     pub voice: String,
@@ -89,7 +88,6 @@ pub struct VolcOptions {
 impl Default for VolcOptions {
     fn default() -> Self {
         Self {
-            app_id: String::new(),
             resource_id: DEFAULT_RESOURCE_ID.to_owned(),
             model: DEFAULT_MODEL.to_owned(),
             voice: DEFAULT_VOICE.to_owned(),
@@ -106,12 +104,6 @@ pub struct Synthesis {
 }
 
 pub fn validate_options(options: VolcOptions) -> Result<VolcOptions, AppError> {
-    let app_id = options.app_id.trim().to_owned();
-    if app_id.is_empty() || app_id.chars().count() > 64 {
-        return Err(AppError::Configuration(
-            "火山引擎 App ID 不能为空且不能超过 64 个字符".to_owned(),
-        ));
-    }
     let resource_id = options.resource_id.trim().to_owned();
     if resource_id.is_empty() || resource_id.chars().count() > 64 {
         return Err(AppError::Configuration(
@@ -141,7 +133,6 @@ pub fn validate_options(options: VolcOptions) -> Result<VolcOptions, AppError> {
         ));
     }
     Ok(VolcOptions {
-        app_id,
         resource_id,
         model,
         voice,
@@ -153,13 +144,13 @@ pub fn validate_options(options: VolcOptions) -> Result<VolcOptions, AppError> {
 pub fn synthesize(
     text: &str,
     options: &VolcOptions,
-    access_token: &str,
+    api_key: &str,
 ) -> Result<Synthesis, AppError> {
     let prepared = prepare_for_speech(text);
     if prepared.is_empty() {
         return Err(AppError::Audio("没有可供朗读的正文".to_owned()));
     }
-    let mut socket = VolcSocket::connect(options, access_token)?;
+    let mut socket = VolcSocket::connect(options, api_key)?;
     socket.start_connection()?;
     socket.start_session()?;
     let audio = socket.request_audio(&prepared)?;
@@ -294,7 +285,7 @@ struct VolcSocket {
 }
 
 impl VolcSocket {
-    fn connect(options: &VolcOptions, access_token: &str) -> Result<Self, AppError> {
+    fn connect(options: &VolcOptions, api_key: &str) -> Result<Self, AppError> {
         let tcp = TcpStream::connect((WS_HOST, 443))
             .map_err(|error| AppError::Network(format!("连接火山引擎失败：{error}")))?;
         tcp.set_read_timeout(Some(READ_TIMEOUT))
@@ -310,19 +301,18 @@ impl VolcSocket {
             session_id: uuid_v4(),
             options: options.clone(),
         };
-        socket.upgrade(options, access_token)?;
+        socket.upgrade(options, api_key)?;
         Ok(socket)
     }
 
-    fn upgrade(&mut self, options: &VolcOptions, access_token: &str) -> Result<(), AppError> {
+    fn upgrade(&mut self, options: &VolcOptions, api_key: &str) -> Result<(), AppError> {
         let request_id = uuid_v4();
         let connect_id = uuid_v4();
+        // The current Volcengine console authenticates with a single API key; older consoles used
+        // App ID + Access Token instead, but Nova targets the API-key flow.
         let request = format!(
-            "GET {WS_PATH} HTTP/1.1\r\nHost: {WS_HOST}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {}\r\nX-Api-App-Id: {}\r\nX-Api-App-Key: {}\r\nX-Api-Access-Key: {}\r\nX-Api-Resource-Id: {}\r\nX-Api-Request-Id: {request_id}\r\nX-Api-Connect-Id: {connect_id}\r\n\r\n",
+            "GET {WS_PATH} HTTP/1.1\r\nHost: {WS_HOST}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {}\r\nX-Api-Key: {api_key}\r\nX-Api-Resource-Id: {}\r\nX-Api-Request-Id: {request_id}\r\nX-Api-Connect-Id: {connect_id}\r\n\r\n",
             websocket_key(),
-            options.app_id,
-            options.app_id,
-            access_token,
             options.resource_id,
         );
         self.stream
@@ -640,7 +630,6 @@ mod tests {
 
     fn options() -> VolcOptions {
         VolcOptions {
-            app_id: "1234567890".to_owned(),
             resource_id: DEFAULT_RESOURCE_ID.to_owned(),
             model: DEFAULT_MODEL.to_owned(),
             voice: DEFAULT_VOICE.to_owned(),
@@ -660,7 +649,6 @@ mod tests {
     #[test]
     fn rejects_missing_ids_and_out_of_range_rates() {
         for mutate in [
-            |draft: &mut VolcOptions| draft.app_id = "  ".to_owned(),
             |draft: &mut VolcOptions| draft.resource_id = String::new(),
             |draft: &mut VolcOptions| draft.model = String::new(),
             |draft: &mut VolcOptions| draft.voice = String::new(),

@@ -77,14 +77,13 @@ const defaultSettings: AppSettings = {
   ttsRate: -5,
   ttsPitch: 0,
   ttsVolume: 0,
-  volcAppId: "",
   volcResourceId: "seed-tts-2.0",
   volcModel: "seed-tts-2.0-standard",
   volcVoice: "zh_female_xiaohe_uranus_bigtts",
   volcSpeechRate: 0,
   volcLoudnessRate: 0,
-  volcAccessToken: null,
-  volcAccessTokenSet: false,
+  volcApiKey: null,
+  volcApiKeySet: false,
 };
 
 const defaultPersona: PersonaProfile = {
@@ -1240,12 +1239,11 @@ function TtsSettingsCard({ settings, onChange }: {
       ? {
           provider: "volcengine",
           voice: settings.volcVoice,
-          appId: settings.volcAppId,
           resourceId: settings.volcResourceId,
           model: settings.volcModel,
           speechRate: settings.volcSpeechRate,
           loudnessRate: settings.volcLoudnessRate,
-          apiKey: settings.volcAccessToken ?? undefined,
+          apiKey: settings.volcApiKey ?? undefined,
         }
       : {
           provider: "edge",
@@ -1279,9 +1277,9 @@ function TtsSettingsCard({ settings, onChange }: {
     }
   }
 
-  const volcTokenPlaceholder = settings.volcAccessTokenSet
+  const volcTokenPlaceholder = settings.volcApiKeySet
     ? "已安全保存；留空表示不修改"
-    : "请输入火山引擎 Access Token";
+    : "请输入火山引擎 API Key";
 
   return (
     <section className="settings-card tts-card">
@@ -1328,17 +1326,13 @@ function TtsSettingsCard({ settings, onChange }: {
       ) : (
         <>
           <label>
-            <span>App ID</span>
-            <input value={settings.volcAppId} onChange={(event) => onChange({ volcAppId: event.target.value })} />
-          </label>
-          <label>
-            <span>Access Token</span>
+            <span>API Key</span>
             <input
               autoComplete="off"
               placeholder={volcTokenPlaceholder}
               type="password"
-              value={settings.volcAccessToken ?? ""}
-              onChange={(event) => onChange({ volcAccessToken: event.target.value })}
+              value={settings.volcApiKey ?? ""}
+              onChange={(event) => onChange({ volcApiKey: event.target.value })}
             />
           </label>
           <label>
@@ -1363,7 +1357,7 @@ function TtsSettingsCard({ settings, onChange }: {
             <div className="tts-control__head"><strong>音量</strong><output>{adjustmentLabel(settings.volcLoudnessRate, "小一点", "大一点")}</output></div>
             <input aria-label="音量" max={100} min={-50} onChange={(event) => onChange({ volcLoudnessRate: Number(event.target.value) })} step={5} type="range" value={settings.volcLoudnessRate} />
           </div>
-          <p className="tts-hint">使用火山引擎豆包语音合成 2.0（WebSocket）；在火山「语音技术」控制台开通并获取 App ID 与 Access Token，资源 ID 默认 seed-tts-2.0。</p>
+          <p className="tts-hint">使用火山引擎豆包语音合成 2.0（WebSocket）；在火山「语音技术」控制台创建 API Key 填入即可，资源 ID 默认 seed-tts-2.0。</p>
         </>
       )}
 
